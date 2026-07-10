@@ -1,0 +1,6 @@
+argon2-cffi
+langchain-community
+langchain-core
+langchain-deepseek
+streamlit
+TTS

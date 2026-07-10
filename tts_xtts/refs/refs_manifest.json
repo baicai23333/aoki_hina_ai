@@ -1,0 +1,42 @@
+{
+  "refs": [
+    "/home/mutsumi/aoki_hina_ai/tts_xtts/refs/ref_001.wav",
+    "/home/mutsumi/aoki_hina_ai/tts_xtts/refs/ref_002.wav",
+    "/home/mutsumi/aoki_hina_ai/tts_xtts/refs/ref_003.wav",
+    "/home/mutsumi/aoki_hina_ai/tts_xtts/refs/ref_004.wav",
+    "/home/mutsumi/aoki_hina_ai/tts_xtts/refs/ref_005.wav",
+    "/home/mutsumi/aoki_hina_ai/tts_xtts/refs/ref_006.wav"
+  ],
+  "segments": [
+    {
+      "file": "ref_001.wav",
+      "start": 0.0,
+      "end": 10.0
+    },
+    {
+      "file": "ref_002.wav",
+      "start": 27.624018140589566,
+      "end": 37.62401814058957
+    },
+    {
+      "file": "ref_003.wav",
+      "start": 55.24803628117913,
+      "end": 65.24803628117914
+    },
+    {
+      "file": "ref_004.wav",
+      "start": 82.8720544217687,
+      "end": 92.8720544217687
+    },
+    {
+      "file": "ref_005.wav",
+      "start": 110.49607256235826,
+      "end": 120.49607256235826
+    },
+    {
+      "file": "ref_006.wav",
+      "start": 138.12009070294783,
+      "end": 148.12009070294783
+    }
+  ]
+}

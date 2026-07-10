@@ -1,0 +1,7 @@
+Model: tts_models/multilingual/multi-dataset/xtts_v2
+Speaker: MyVoice
+Language: ja
+Refs: 6
+Warmup wav: /home/mutsumi/aoki_hina_ai/tts_xtts/work/warmup.wav
+Cached voice inference: supported
+AOKI_XTTS_USE_CACHED_VOICE=1
