@@ -16,5 +16,15 @@ tts_cache/
 tts_xtts/work/
 tts_xtts/raw/
 
+# Local GPT-SoVITS runtime, models, downloads, and generated audio
+GPT-SoVITS-package/
+GPT-SoVITS*.zip
+GPT-SoVITS*.7z*
+gpt-sovits-*-parts/
+gpt_sovits_api.log
+/1/
+/new_1*
+/zero_shot_test.wav
+
 =*
 .DS_Store
