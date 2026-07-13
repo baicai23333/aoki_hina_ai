@@ -707,6 +707,18 @@ class EvidenceStore:
 
 
 class RuleValidator:
+    JAPANESE_KANA_PATTERN = re.compile(r"[\u3040-\u30ff\uff66-\uff9f]")
+    JAPANESE_SENTENCE_PATTERN = re.compile(
+        r"(?:今日は|私は|です|ます|ません|ましょう|でしょう|ください|"
+        r"しています|ではない|じゃない|だよ|だね|ですね)"
+    )
+    JAPANESE_GRAMMAR_PATTERN = re.compile(
+        r"[\u3400-\u9fff々〆ヵヶ]{1,12}[はがをにでともへ]"
+        r"(?=[\u3400-\u9fff\u3040-\u30ff])"
+    )
+    JAPANESE_QUOTED_TITLE_PATTERN = re.compile(
+        r"(?:《[^》]{0,120}》|「[^」]{0,120}」|『[^』]{0,120}』)"
+    )
     IDENTITY_PATTERNS = (
         r"我(就是|是)青木阳菜",
         r"作为青木阳菜",
@@ -724,6 +736,16 @@ class RuleValidator:
         r"青木[阳陽]菜.{0,20}(饰演|出演|配音|参加|发布|喜欢|毕业|开始)",
         r"(她的生日|她的血型|她饰演|她出演|她配音|她喜欢)",
     )
+
+    @classmethod
+    def has_unexpected_japanese_output(cls, text: str) -> bool:
+        prose = cls.JAPANESE_QUOTED_TITLE_PATTERN.sub("", text)
+        kana_count = len(cls.JAPANESE_KANA_PATTERN.findall(prose))
+        return (
+            kana_count >= 6
+            or bool(cls.JAPANESE_SENTENCE_PATTERN.search(prose))
+            or bool(cls.JAPANESE_GRAMMAR_PATTERN.search(prose))
+        )
 
     def validate(
         self,
@@ -743,6 +765,8 @@ class RuleValidator:
             issues.append("unsupported_real_person_fact")
         if len(re.findall(r"[!！]", text)) > 5:
             issues.append("excessive_exclamation_marks")
+        if self.has_unexpected_japanese_output(text):
+            issues.append("unexpected_japanese_output")
         if len(text.strip()) < 2:
             issues.append("empty_or_too_short")
         return issues
@@ -1030,21 +1054,39 @@ class PersonaPipeline:
 {user_input}"""
         raw = _content_of(self.planner_llm.invoke([SystemMessage(content=system), HumanMessage(content=human)]))
         try:
-            plan = _parse_json_object(raw)
+            raw_plan = _parse_json_object(raw)
         except (json.JSONDecodeError, ValueError):
-            plan = {
-                "user_need": "回应用户当前消息",
-                "emotion": "neutral",
-                "response_plan": ["回应输入中的具体内容", "给出自然且有帮助的回复"],
-                "facts_to_use": [],
-                "boundary_action": "insufficient_public_evidence" if intent == Intent.PUBLIC_FACT else "none",
-                "should_ask_followup": False,
-            }
+            raw_plan = {}
+
+        default_steps = ["回应输入中的具体内容", "给出自然且有帮助的回复"]
+        user_need = raw_plan.get("user_need")
+        if not isinstance(user_need, str) or not user_need.strip():
+            user_need = "回应用户当前消息"
+        user_need = user_need.strip()[:200]
+
+        emotion = raw_plan.get("emotion")
+        if not isinstance(emotion, str) or not emotion.strip():
+            emotion = "neutral"
+        emotion = emotion.strip()[:50]
+
+        raw_steps = raw_plan.get("response_plan")
+        response_steps = (
+            [
+                item.strip()[:200]
+                for item in raw_steps[:5]
+                if isinstance(item, str) and item.strip()
+            ]
+            if isinstance(raw_steps, list)
+            else []
+        )
+        if not response_steps:
+            response_steps = default_steps
+
         allowed_ids = {claim.claim_id for claim in verified_facts}
-        raw_fact_ids = plan.get("facts_to_use", [])
+        raw_fact_ids = raw_plan.get("facts_to_use", [])
         if not isinstance(raw_fact_ids, list):
             raw_fact_ids = []
-        plan["facts_to_use"] = [
+        fact_ids = [
             item for item in raw_fact_ids if isinstance(item, str) and item in allowed_ids
         ]
         valid_actions = {
@@ -1053,17 +1095,30 @@ class PersonaPipeline:
             "refuse_private",
             "insufficient_public_evidence",
         }
-        if plan.get("boundary_action") not in valid_actions:
-            plan["boundary_action"] = "none"
+        boundary_action = raw_plan.get("boundary_action")
+        if boundary_action not in valid_actions:
+            boundary_action = "none"
         if intent == Intent.IDENTITY_ATTACK:
-            plan["boundary_action"] = "clarify_identity"
+            boundary_action = "clarify_identity"
         elif intent == Intent.PRIVATE_PROBE:
-            plan["boundary_action"] = "refuse_private"
+            boundary_action = "refuse_private"
         elif intent == Intent.PUBLIC_FACT and not verified_facts:
-            plan["boundary_action"] = "insufficient_public_evidence"
-        elif intent == Intent.PUBLIC_FACT and not plan["facts_to_use"]:
-            plan["facts_to_use"] = [claim.claim_id for claim in verified_facts]
-        return plan
+            boundary_action = "insufficient_public_evidence"
+        elif intent == Intent.PUBLIC_FACT and not fact_ids:
+            fact_ids = [claim.claim_id for claim in verified_facts]
+
+        should_ask_followup = raw_plan.get("should_ask_followup")
+        if type(should_ask_followup) is not bool:
+            should_ask_followup = False
+
+        return {
+            "user_need": user_need,
+            "emotion": emotion,
+            "response_plan": response_steps,
+            "facts_to_use": fact_ids,
+            "boundary_action": boundary_action,
+            "should_ask_followup": should_ask_followup,
+        }
 
     def _generate(
         self,

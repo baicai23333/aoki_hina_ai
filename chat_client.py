@@ -1,18 +1,23 @@
 import streamlit as st
 import sqlite3
-import hashlib
 import socket
-from datetime import datetime
+import time
 from pathlib import Path
 from openai import APIConnectionError, APITimeoutError
-from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
 from langchain_deepseek import ChatDeepSeek
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
+from chat_storage import (
+    PLAYABLE_TRANSLATION_STATUSES,
+    init_chat_storage_schema,
+    list_messages,
+    save_exchange,
+    update_message_audio as update_stored_message_audio,
+)
+from pipeline_debug import build_debug_trace
 from persona_pipeline import PersonaPipeline
-from tts_engine import TTSEngine, load_env_var
+from response_translation import ResponseTranslationService, TranslationResult
+from tts_engine import TTSEngine, load_env_var, safe_cached_wav_path
 from user_memory import (
     MEMORY_CATEGORIES,
     UserMemoryLimitError,
@@ -23,7 +28,6 @@ from user_memory import (
     list_memories,
     upsert_memory,
 )
-ph = PasswordHasher()
 # ================== DeepSeek API Key ==================
 API_KEY = load_env_var("DEEPSEEK_API_KEY")
 if not API_KEY:
@@ -78,6 +82,7 @@ def create_llm(temperature, max_tokens):
 planner_llm = create_llm(temperature=0.2, max_tokens=700)
 generator_llm = create_llm(temperature=0.8, max_tokens=1024)
 validator_llm = create_llm(temperature=0.0, max_tokens=700)
+translator_llm = create_llm(temperature=0.0, max_tokens=1024)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 try:
@@ -91,6 +96,7 @@ persona_pipeline = PersonaPipeline(
     persona_dir=PROJECT_DIR / "persona",
     max_history_messages=PERSONA_HISTORY_MESSAGES,
 )
+translation_service = ResponseTranslationService(translator_llm, validator_llm)
 
 # ================== 安装 argon2（如果未安装会提示） ==================
 try:
@@ -100,17 +106,6 @@ try:
 except ImportError:
     st.error("缺少 argon2-cffi 包，请在虚拟环境中运行：pip install argon2-cffi")
     st.stop()
-
-translation_prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "将用户提供的中文回复翻译成自然、亲切、适合语音朗读的日语。"
-        "忠实保留原意、语气、称呼和情绪，不要添加信息。"
-        "只输出日语译文，不要解释，不要添加标题或引号。",
-    ),
-    ("human", "{text}"),
-])
-translation_chain = translation_prompt | generator_llm
 
 # ================== SQLite 数据库 ==================
 DB_FILE = PROJECT_DIR / "chat_history.db"
@@ -140,6 +135,7 @@ def init_db():
             cursor.execute("ALTER TABLE chat_history ADD COLUMN japanese_content TEXT")
         if "audio_path" not in columns:
             cursor.execute("ALTER TABLE chat_history ADD COLUMN audio_path TEXT")
+        init_chat_storage_schema(conn)
         init_user_memory_schema(conn)
         conn.commit()
     finally:
@@ -150,6 +146,11 @@ init_db()
 # ================== TTS 配置 ==================
 def is_tts_enabled():
     value = (load_env_var("AOKI_TTS_ENABLED", "0") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def is_debug_enabled():
+    value = (load_env_var("AOKI_DEBUG_UI", "0") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 # ================== 用户函数（argon2） ==================
@@ -181,59 +182,6 @@ def verify_user(username, password):
         except VerifyMismatchError:
             return False
     return False
-
-# ================== 聊天记录函数 ==================
-def load_history(username):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT type, content FROM chat_history WHERE username = ? ORDER BY timestamp ASC", (username,))
-    rows = cursor.fetchall()
-    messages = []
-    for row in rows:
-        if row[0] == "human":
-            messages.append(HumanMessage(content=row[1]))
-        elif row[0] == "ai":
-            messages.append(AIMessage(content=row[1]))
-    conn.close()
-    return messages
-
-def load_ai_metadata(username):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, content, japanese_content, audio_path FROM chat_history "
-        "WHERE username = ? AND type = 'ai' ORDER BY id ASC",
-        (username,),
-    )
-    metadata = {
-        content: {"id": message_id, "japanese": japanese or "", "audio_path": audio_path or ""}
-        for message_id, content, japanese, audio_path in cursor.fetchall()
-    }
-    conn.close()
-    return metadata
-
-
-def save_message(username, msg_type, content, japanese_content=None, audio_path=None):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute(
-        "INSERT INTO chat_history "
-        "(username, type, content, japanese_content, audio_path, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-        (username, msg_type, content, japanese_content, audio_path, timestamp),
-    )
-    message_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return message_id
-
-
-def update_message_audio(message_id, audio_path):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE chat_history SET audio_path = ? WHERE id = ?", (audio_path, message_id))
-    conn.commit()
-    conn.close()
 
 # ================== Streamlit 界面 ==================
 PORTAL_LINKS = [
@@ -411,6 +359,18 @@ def render_memory_sidebar(username):
                     st.error("暂时无法清空记忆，请稍后再试。")
 
 
+def render_debug_sidebar(username):
+    if not is_debug_enabled():
+        return
+    trace = st.session_state.get(f"pipeline_trace_{username}")
+    with st.sidebar.expander("管线调试（脱敏）", expanded=False):
+        st.caption("仅显示路由、证据 ID、状态和耗时；不包含聊天内容、提示词、路径或原始错误。")
+        if trace is None:
+            st.caption("完成一轮对话后，这里会显示最近一次脱敏记录。")
+        else:
+            st.json(trace)
+
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.username = None
@@ -418,6 +378,7 @@ if "authenticated" not in st.session_state:
 if not st.session_state.authenticated:
     st.title("🥹 青木阳菜AI Project")
     st.caption("喵喵喵 made by baicai")
+    st.caption("非官方粉丝创作 AI，与青木阳菜本人及相关官方组织无关。")
     render_portal_links()
 
     tab_login, tab_register = st.tabs(["登录", "注册"])
@@ -446,74 +407,121 @@ if not st.session_state.authenticated:
                 st.error("用户名或密码错误哦～🥹")
 
 else:
-    st.sidebar.write(f"当前用户：**{st.session_state.username}** 🩵")
+    username = st.session_state.username
+    auto_tts_key = f"auto_tts_{username}"
+    pending_autoplay_key = f"pending_autoplay_message_id_{username}"
+    tts_flash_key = f"tts_flash_error_{username}"
+    st.sidebar.write(f"当前用户：**{username}** 🩵")
     if st.sidebar.button("退出登录"):
+        st.session_state.pop(pending_autoplay_key, None)
+        st.session_state.pop(tts_flash_key, None)
         st.session_state.authenticated = False
         st.session_state.username = None
         st.rerun()
 
-    render_memory_sidebar(st.session_state.username)
+    render_memory_sidebar(username)
+    render_debug_sidebar(username)
 
     tts_enabled = is_tts_enabled()
-    if "auto_tts" not in st.session_state:
-        st.session_state.auto_tts = tts_enabled
-    if "tts_auto_played_id" not in st.session_state:
-        st.session_state.tts_auto_played_id = None
+    if auto_tts_key not in st.session_state:
+        st.session_state[auto_tts_key] = tts_enabled
+    if not tts_enabled:
+        st.session_state[auto_tts_key] = False
+        st.session_state.pop(pending_autoplay_key, None)
 
-    auto_tts = st.sidebar.toggle("Auto TTS", value=st.session_state.auto_tts, disabled=not tts_enabled)
-    st.session_state.auto_tts = auto_tts
+    auto_tts = st.sidebar.toggle(
+        "Auto TTS",
+        key=auto_tts_key,
+        disabled=not tts_enabled,
+    )
     if not tts_enabled:
         st.sidebar.caption("AOKI_TTS_ENABLED=0，已关闭语音播放")
-    tts_flash_error = st.session_state.pop("tts_flash_error", None)
+    tts_flash_error = st.session_state.pop(tts_flash_key, None)
     if tts_flash_error:
         st.warning(tts_flash_error)
 
-    # 加载历史 + 聊天逻辑
-    history = StreamlitChatMessageHistory(key=f"chat_{st.session_state.username}")
-    history_loaded_key = f"history_loaded_{st.session_state.username}"
-    if not st.session_state.get(history_loaded_key):
-        loaded_messages = load_history(st.session_state.username)
-        for msg in loaded_messages:
-            history.add_message(msg)
-        st.session_state[history_loaded_key] = True
-    ai_metadata = load_ai_metadata(st.session_state.username)
+    # SQLite is the canonical history. Rebuild model context from immutable row IDs.
+    try:
+        stored_messages = list_messages(DB_FILE, username)
+    except Exception:
+        st.error("暂时无法读取聊天记录，请稍后再试。")
+        st.stop()
+    history = StreamlitChatMessageHistory(key=f"chat_{username}")
+    history.clear()
+    for record in stored_messages:
+        if record.type == "human":
+            history.add_message(HumanMessage(content=record.content))
+        elif record.type == "ai":
+            history.add_message(AIMessage(content=record.content))
 
+    st.caption("Hina Bot 是非官方粉丝创作 AI，不是青木阳菜本人；日语语音由 AI 合成。")
     st.caption("和阳菜聊点什么吧～🐈✨")
 
-    for msg in history.messages:
-        if isinstance(msg, HumanMessage):
-            st.chat_message("user").write(msg.content)
-        elif isinstance(msg, AIMessage):
+    for record in stored_messages:
+        if record.type == "human":
+            st.chat_message("user").write(record.content)
+        elif record.type == "ai":
             with st.chat_message("assistant"):
                 st.markdown("**中文**")
-                st.write(msg.content)
-                metadata = ai_metadata.get(msg.content, {})
-                japanese_history = metadata.get("japanese", "")
+                st.write(record.content)
+
+                is_playable_translation = (
+                    record.translation_status in PLAYABLE_TRANSLATION_STATUSES
+                )
+                is_legacy_translation = record.translation_status == "legacy_unverified"
+                japanese_history = (
+                    record.japanese_content
+                    if is_playable_translation or is_legacy_translation
+                    else None
+                )
                 if japanese_history:
                     st.markdown("**日本語**")
                     st.write(japanese_history)
+                    if is_legacy_translation:
+                        st.caption("旧版未复核译文：可以阅读，但不会用于语音播放。")
 
-                audio_path = metadata.get("audio_path", "")
-                audio_exists = bool(audio_path) and Path(audio_path).exists()
-                if audio_exists:
-                    should_autoplay_history = st.session_state.get("pending_autoplay_audio") == audio_path
-                    st.audio(audio_path, format="audio/wav", autoplay=should_autoplay_history)
+                verified_audio_path = (
+                    safe_cached_wav_path(record.audio_path)
+                    if tts_enabled and is_playable_translation and record.audio_path
+                    else None
+                )
+                if verified_audio_path is not None:
+                    should_autoplay_history = (
+                        st.session_state.get(pending_autoplay_key) == record.id
+                    )
+                    st.audio(
+                        str(verified_audio_path),
+                        format="audio/wav",
+                        autoplay=should_autoplay_history,
+                    )
                     if should_autoplay_history:
-                        st.session_state.pending_autoplay_audio = None
-                elif japanese_history:
-                    play_key = f"tts_history_play_{metadata.get('id', hashlib.sha256(msg.content.encode()).hexdigest())}"
+                        st.session_state.pop(pending_autoplay_key, None)
+                elif tts_enabled and is_playable_translation and japanese_history:
+                    if st.session_state.get(pending_autoplay_key) == record.id:
+                        st.session_state.pop(pending_autoplay_key, None)
+                    play_key = f"tts_history_play_{record.id}"
                     if st.button("Play", key=play_key, disabled=not tts_enabled):
                         try:
                             with st.spinner("正在合成日语语音..."):
                                 wav_path = TTSEngine.get().synthesize_to_file(japanese_history)
-                            update_message_audio(metadata["id"], str(wav_path))
-                            st.session_state.pending_autoplay_audio = str(wav_path)
+                            updated = update_stored_message_audio(
+                                DB_FILE,
+                                username,
+                                record.id,
+                                str(wav_path),
+                            )
+                            if not updated:
+                                raise RuntimeError("audio metadata update was rejected")
+                            st.session_state[pending_autoplay_key] = record.id
                             st.rerun()
-                        except Exception as exc:
-                            st.warning(f"TTS 播放失败：{exc}")
+                        except Exception:
+                            st.warning("语音暂时生成失败，请稍后再试。")
 
     if user_input := st.chat_input("说点什么给阳菜听吧～"):
         st.chat_message("user").write(user_input)
+
+        stage_duration_ms = {}
+        pipeline_started = time.perf_counter()
 
         with st.chat_message("assistant"):
             with st.spinner("阳菜在思考中...🥹"):
@@ -521,7 +529,7 @@ else:
                     try:
                         current_user_memories = list_memories(
                             DB_FILE,
-                            st.session_state.username,
+                            username,
                         )
                     except Exception:
                         current_user_memories = []
@@ -532,47 +540,108 @@ else:
                         user_memories=current_user_memories,
                     )
                     response_text = pipeline_result.content
+                    if (
+                        pipeline_result.intent.value
+                        in {"daily_chat", "emotion_support", "music_advice", "fan_chat"}
+                        and persona_pipeline.rule_validator.has_unexpected_japanese_output(
+                            response_text
+                        )
+                    ):
+                        st.error("本轮回复未通过输出语言检查，请换一种说法再试。")
+                        st.stop()
                 except (APIConnectionError, APITimeoutError):
                     st.error("暂时无法连接 DeepSeek，请稍后再试。应用会自动重试连接。")
                     st.stop()
-                except Exception as exc:
-                    st.error(f"对话请求失败：{type(exc).__name__}: {exc}")
+                except Exception:
+                    st.error("这轮对话暂时没有生成成功，请稍后再试。")
                     st.stop()
+            stage_duration_ms["pipeline"] = (
+                time.perf_counter() - pipeline_started
+            ) * 1000
 
-            japanese_text = ""
+            translation_started = time.perf_counter()
             try:
                 with st.spinner("日本語に翻訳しています..."):
-                    translated = translation_chain.invoke({"text": response_text})
-                    japanese_text = translated.content.strip()
-            except Exception as exc:
-                st.warning(f"日语翻译失败：{type(exc).__name__}: {exc}")
+                    translation_result = translation_service.translate(
+                        response_text,
+                        pipeline_result.intent.value,
+                        pipeline_result.plan.get("boundary_action", "none"),
+                    )
+            except Exception:
+                translation_result = TranslationResult(
+                    text="",
+                    status="failed",
+                    issue_codes=("translator_exception",),
+                )
+            stage_duration_ms["translation"] = (
+                time.perf_counter() - translation_started
+            ) * 1000
+            japanese_text = (
+                translation_result.text
+                if translation_result.status in PLAYABLE_TRANSLATION_STATUSES
+                else ""
+            )
 
             st.markdown("**中文**")
             st.write(response_text)
             if japanese_text:
                 st.markdown("**日本語**")
                 st.write(japanese_text)
+            else:
+                st.warning("日语译文未通过本轮复核，这条消息仅显示中文。")
 
-            audio_path = None
+            issue_code = (
+                translation_result.issue_codes[0]
+                if translation_result.issue_codes
+                else None
+            )
+            try:
+                _, ai_message_id = save_exchange(
+                    DB_FILE,
+                    username,
+                    user_input,
+                    response_text,
+                    japanese_text or None,
+                    translation_result.status,
+                    issue_code,
+                    None,
+                )
+            except Exception:
+                st.error("回复已经生成，但聊天记录暂时没有保存成功；请稍后重试。")
+                st.stop()
+
+            audio_attached = False
+            tts_status = "disabled" if not tts_enabled else "not_requested"
             should_auto_play = tts_enabled and auto_tts and bool(japanese_text)
             if should_auto_play:
+                tts_started = time.perf_counter()
                 try:
                     with st.spinner("正在合成日语语音..."):
                         wav_path = TTSEngine.get().synthesize_to_file(japanese_text)
-                    audio_path = str(wav_path)
-                except Exception as exc:
-                    st.session_state.tts_flash_error = f"TTS 播放失败：{exc}"
+                    audio_attached = update_stored_message_audio(
+                        DB_FILE,
+                        username,
+                        ai_message_id,
+                        str(wav_path),
+                    )
+                    if not audio_attached:
+                        raise RuntimeError("audio metadata update was rejected")
+                    tts_status = "succeeded"
+                except Exception:
+                    tts_status = "failed"
+                    st.session_state[tts_flash_key] = "语音暂时生成失败，请稍后再试。"
+                stage_duration_ms["tts"] = (
+                    time.perf_counter() - tts_started
+                ) * 1000
 
         history.add_user_message(user_input)
         history.add_ai_message(response_text)
-        save_message(st.session_state.username, "human", user_input)
-        save_message(
-            st.session_state.username,
-            "ai",
-            response_text,
-            japanese_text,
-            audio_path,
+        st.session_state[f"pipeline_trace_{username}"] = build_debug_trace(
+            pipeline_result,
+            translation_status=translation_result.status,
+            tts_status=tts_status,
+            stage_duration_ms=stage_duration_ms,
         )
-        if audio_path:
-            st.session_state.pending_autoplay_audio = audio_path
+        if audio_attached:
+            st.session_state[pending_autoplay_key] = ai_message_id
         st.rerun()

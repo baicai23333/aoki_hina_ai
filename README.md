@@ -11,9 +11,11 @@ Streamlit chat app for a non-official fan-created AI character inspired by Aoki 
 - A five-stage persona pipeline with deterministic safety routing
 - A verified source registry with explicit quarantine states
 - Granular public fact claims kept separate from style guidance and user history
-- GPT-SoVITS zero-shot voice cloning with a Japanese reference clip
+- Optional GPT-SoVITS speech synthesis with a licensed or original Japanese reference clip
 - Automatic local GPT-SoVITS API startup and WAV caching
-- Chinese and Japanese assistant output, with Japanese-only speech playback
+- Chinese and strictly reviewed Japanese assistant output, with Japanese-only speech playback
+- Message-ID-scoped translation and audio metadata, including safe legacy-history migration
+- Optional allowlisted pipeline diagnostics that never include chat text or raw errors
 
 ## Setup
 
@@ -44,7 +46,9 @@ user input
   -> public fact question: deterministic rendering from verified claims
   -> other scenes: DeepSeek planning and styled generation
   -> strict DeepSeek review + deterministic identity/privacy checks
-  -> translation and optional TTS
+  -> temperature-zero translation + deterministic checks + strict review
+  -> atomic message-ID-scoped history save
+  -> validated Japanese only: optional TTS attached to that message ID
 ```
 
 Persona materials live under `persona/`:
@@ -91,12 +95,20 @@ For ordinary chat, the pipeline selects at most six items. Preferred names and c
 
 Memory is stored in the local, unencrypted `chat_history.db`. Selected entries are sent to DeepSeek with the current request. Deleting an entry prevents future use but does not erase existing chat records or TTS audio that may already contain related text. Do not store passwords, API keys, addresses, identity documents, medical or financial data, or another person's private information.
 
+## Translation, history, and diagnostics
+
+Ordinary Japanese translations use a separate temperature-zero translator, deterministic identity/privacy/name/number checks, and a strict reviewer that can only accept or reject. Identity, private-information, and insufficient-evidence routes use fixed reviewed Japanese responses without a translation-model call. If translation or review fails, the app stores and shows the Chinese answer only; rejected candidate text and raw model errors are never shown.
+
+Each assistant message keeps its own immutable database ID, translation status, and audio path. Only `validated` and `fixed` Japanese can be synthesized or played. Japanese text created before this migration is retained as `legacy_unverified` for reading, but it cannot be voiced until replaced by a reviewed translation. Audio playback accepts only valid WAV files inside the configured TTS cache. The TTS master switch also hides existing players, and autoplay/pending state is isolated per signed-in account.
+
+Set `AOKI_DEBUG_UI=1` for an optional local sidebar trace. It exposes only allowlisted route names, evidence/fact/memory IDs, boundary and validation codes, stage statuses, and rounded timings. It does not contain user or assistant text, memory values, prompts, file paths, candidate translations, or raw exceptions, and it is not written to the chat database.
+
 ## GPT-SoVITS Setup
 
 Set `AOKI_TTS_ENABLED=1` and `AOKI_TTS_BACKEND=gpt_sovits` in `.env`.
-Set `GPT_SOVITS_ROOT` to an installed GPT-SoVITS directory, then configure a local 3–10 second reference WAV and its exact transcript using `GPT_SOVITS_REFERENCE_AUDIO` and `GPT_SOVITS_REFERENCE_TEXT`.
+Set `GPT_SOVITS_ROOT` to an installed GPT-SoVITS directory, then configure a local 3–10 second licensed or original reference WAV and its exact transcript using `GPT_SOVITS_REFERENCE_AUDIO` and `GPT_SOVITS_REFERENCE_TEXT`. Do not use a real person's recording without permission or present synthesized speech as that person.
 
-With `GPT_SOVITS_AUTO_START=1`, the chat app starts the local API on port 9880 when speech is first requested. Model packages, reference recordings, generated speech, `.env`, logs, and chat databases are intentionally excluded from Git.
+With `GPT_SOVITS_AUTO_START=1`, the chat app starts the configured local API when speech is first requested; non-local endpoints are never auto-started. The response must have an accepted WAV media type and a complete, decodable PCM WAV structure; invalid or partial output is deleted. Cache keys include the relevant voice/configuration inputs, same-text synthesis is locked, and the oldest cached files are pruned according to `AOKI_TTS_CACHE_MAX_FILES` and `AOKI_TTS_CACHE_MAX_BYTES`. Model packages, reference recordings, generated speech, `.env`, logs, and chat databases are intentionally excluded from Git.
 
 ## Legacy XTTS Setup
 
