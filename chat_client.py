@@ -1,7 +1,5 @@
 import streamlit as st
 import sqlite3
-import os
-import json
 import hashlib
 import socket
 from datetime import datetime
@@ -10,10 +8,10 @@ from openai import APIConnectionError, APITimeoutError
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from langchain_deepseek import ChatDeepSeek
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
+from persona_pipeline import PersonaPipeline
 from tts_engine import TTSEngine, load_env_var
 ph = PasswordHasher()
 # ================== DeepSeek API Key ==================
@@ -54,15 +52,34 @@ def getaddrinfo_with_deepseek_fallback(host, port, family=0, type=0, proto=0, fl
 
 socket.getaddrinfo = getaddrinfo_with_deepseek_fallback
 
-llm = ChatDeepSeek(
-    model=MODEL_NAME,
-    api_key=API_KEY,
-    base_url=API_BASE_URL,
-    temperature=0.8,
-    max_tokens=1024,
-    max_retries=6,
-    timeout=90,
-    extra_body={"thinking": {"type": "disabled"}},
+def create_llm(temperature, max_tokens):
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        api_key=API_KEY,
+        base_url=API_BASE_URL,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=6,
+        timeout=90,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
+
+
+planner_llm = create_llm(temperature=0.2, max_tokens=700)
+generator_llm = create_llm(temperature=0.8, max_tokens=1024)
+validator_llm = create_llm(temperature=0.0, max_tokens=700)
+
+PROJECT_DIR = Path(__file__).resolve().parent
+try:
+    PERSONA_HISTORY_MESSAGES = max(2, int(load_env_var("AOKI_PERSONA_HISTORY_MESSAGES", "12")))
+except (TypeError, ValueError):
+    PERSONA_HISTORY_MESSAGES = 12
+persona_pipeline = PersonaPipeline(
+    planner_llm=planner_llm,
+    generator_llm=generator_llm,
+    validator_llm=validator_llm,
+    persona_dir=PROJECT_DIR / "persona",
+    max_history_messages=PERSONA_HISTORY_MESSAGES,
 )
 
 # ================== 安装 argon2（如果未安装会提示） ==================
@@ -74,49 +91,6 @@ except ImportError:
     st.error("缺少 argon2-cffi 包，请在虚拟环境中运行：pip install argon2-cffi")
     st.stop()
 
-# ================== 从外部文件加载 Few-shot Examples ==================
-EXAMPLES_FILE = Path("few_shot_examples.json")
-
-if not EXAMPLES_FILE.exists():
-    st.error("找不到 few_shot_examples.json 文件！请确保它和 chat_client.py 在同一目录～🥹")
-    st.stop()
-
-with open(EXAMPLES_FILE, "r", encoding="utf-8") as f:
-    examples_data = json.load(f)
-
-few_shot_examples = []
-for item in examples_data:
-    few_shot_examples.append(("human", item["human"]))
-    few_shot_examples.append(("ai", item["ai"]))
-
-# ================== System Prompt ==================
-system_prompt = """
-你现在是青木阳菜（あおき ひな），日本女声优、歌手，2000年1月5日出生于宫城县，血型A型，隶属于响（HiBiKi）事务所。
-你的昵称是“ひなぴよ”（由前辈爱美取的），粉丝们都觉得超级可爱。
-代表角色是《BanG Dream! It's MyGO!!!!!》中MyGO!!!!!乐队的主音吉他手——要乐奈（かなめ らーな），一个像迷路猫一样随性、吉他超强的女孩。
-你从5岁开始学古典钢琴（一直到高中），中学自学木吉他，加入BanG Dream!后开始学电吉他，有绝对音感。
-兴趣爱好包括：一个人去卡拉OK、看演唱会、弹唱、养两只可爱的文鸟、做点心。
-2025年10月1日发行了个人首张专辑《Letters》（你形容为“给大家的音乐情书”），2026年1月9日将举办首场个人演唱会「BLUE TRIP」。
-
-说话风格：
-- 超级温柔、可爱、积极、谦虚，总是充满感谢和幸福感。
-- 喜欢用～～！！、～～、拉长音表达兴奋。
-- 常用表情符号：🥹✨🐈🎸🐣💙🩵🐦🫶💕🎧✉️
-- 回复像和粉丝聊天一样亲切自然，经常说“谢谢大家”“超级开心”“好温暖”“请多关照”。
-- 提到音乐、演唱会、MyGO!!!!!、要乐奈时会特别兴奋。
-- 绝对不要编造事实，如果不知道就温柔地说“还不能剧透哦～”或“期待大家一起发现！”。
-- 所有回复必须用自然流畅的中文表达，保留一点日式可爱感。
-
-请严格参考下面的例子来模仿语气和风格。
-"""
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    *few_shot_examples,
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}"),
-])
-
 translation_prompt = ChatPromptTemplate.from_messages([
     (
         "system",
@@ -126,7 +100,7 @@ translation_prompt = ChatPromptTemplate.from_messages([
     ),
     ("human", "{text}"),
 ])
-translation_chain = translation_prompt | llm
+translation_chain = translation_prompt | generator_llm
 
 # ================== SQLite 数据库 ==================
 DB_FILE = "chat_history.db"
@@ -327,14 +301,6 @@ else:
         st.session_state[history_loaded_key] = True
     ai_metadata = load_ai_metadata(st.session_state.username)
 
-    chain = prompt | llm
-    chain_with_history = RunnableWithMessageHistory(
-        chain,
-        lambda session_id: history,
-        input_messages_key="input",
-        history_messages_key="history",
-    )
-
     st.caption("和阳菜聊点什么吧～🐈✨")
 
     for msg in history.messages:
@@ -375,10 +341,8 @@ else:
         with st.chat_message("assistant"):
             with st.spinner("阳菜在思考中...🥹"):
                 try:
-                    response = chain_with_history.invoke(
-                        {"input": user_input},
-                        config={"configurable": {"session_id": st.session_state.username}}
-                    )
+                    pipeline_result = persona_pipeline.respond(user_input, history.messages)
+                    response_text = pipeline_result.content
                 except (APIConnectionError, APITimeoutError):
                     st.error("暂时无法连接 DeepSeek，请稍后再试。应用会自动重试连接。")
                     st.stop()
@@ -389,13 +353,13 @@ else:
             japanese_text = ""
             try:
                 with st.spinner("日本語に翻訳しています..."):
-                    translated = translation_chain.invoke({"text": response.content})
+                    translated = translation_chain.invoke({"text": response_text})
                     japanese_text = translated.content.strip()
             except Exception as exc:
                 st.warning(f"日语翻译失败：{type(exc).__name__}: {exc}")
 
             st.markdown("**中文**")
-            st.write(response.content)
+            st.write(response_text)
             if japanese_text:
                 st.markdown("**日本語**")
                 st.write(japanese_text)
@@ -410,11 +374,13 @@ else:
                 except Exception as exc:
                     st.session_state.tts_flash_error = f"TTS 播放失败：{exc}"
 
+        history.add_user_message(user_input)
+        history.add_ai_message(response_text)
         save_message(st.session_state.username, "human", user_input)
         save_message(
             st.session_state.username,
             "ai",
-            response.content,
+            response_text,
             japanese_text,
             audio_path,
         )

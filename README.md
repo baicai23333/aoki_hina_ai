@@ -1,13 +1,14 @@
 # Aoki Hina AI
 
-Streamlit chat app that roleplays as Aoki Hina in Chinese, using DeepSeek for chat and GPT-SoVITS for cloned-voice playback.
+Streamlit chat app for a non-official fan-created AI character inspired by Aoki Hina's public materials. It uses DeepSeek for chat and GPT-SoVITS for optional local speech playback.
 
 ## Features
 
 - Streamlit login and registration UI
 - SQLite-backed user and chat history storage
 - DeepSeek chat model through LangChain
-- Few-shot examples for character tone
+- A five-stage persona pipeline with deterministic safety routing
+- Separate public-evidence cards, user chat history, and reviewed few-shot examples
 - GPT-SoVITS zero-shot voice cloning with a Japanese reference clip
 - Automatic local GPT-SoVITS API startup and WAV caching
 - Chinese and Japanese assistant output, with Japanese-only speech playback
@@ -27,6 +28,37 @@ Edit `.env` and set `DEEPSEEK_API_KEY`.
 
 ```powershell
 streamlit run chat_client.py
+```
+
+## Persona pipeline
+
+The main response path is:
+
+```text
+user input
+  -> deterministic scene classification
+  -> local evidence-card retrieval
+  -> DeepSeek response planning
+  -> DeepSeek styled response generation
+  -> DeepSeek review + deterministic identity checks
+  -> translation and optional TTS
+```
+
+Persona materials live under `persona/`:
+
+- `identity.md`, `tone.md`, `interaction_rules.md`, and `boundaries.md` define stable behavior.
+- `evidence_cards.jsonl` contains entity-tagged public facts and response strategies.
+- `style_evidence_cards.jsonl` contains the imported 18-card public-expression pattern set. Its `SRC-*` references are currently unverified and therefore cannot support real-person facts.
+- `fewshot_dialogues.jsonl` contains reviewed conversation examples.
+- `evaluation_cases.jsonl` is the fixed regression set for future prompt changes.
+- `IMPORT_NOTES.md` records how the supplied Persona v1 files were normalized and which conflict was resolved.
+
+Only cards with `can_support_fact: true` may support claims about the real person, a role, a work, or an event. Public-person facts, fictional-character facts, and original Hina Bot behavior use separate entity tags.
+
+Run the local tests without making an API request:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 ## GPT-SoVITS Setup
