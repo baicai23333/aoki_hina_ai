@@ -13,6 +13,16 @@ from langchain_community.chat_message_histories import StreamlitChatMessageHisto
 from langchain_core.messages import HumanMessage, AIMessage
 from persona_pipeline import PersonaPipeline
 from tts_engine import TTSEngine, load_env_var
+from user_memory import (
+    MEMORY_CATEGORIES,
+    UserMemoryLimitError,
+    UserMemoryValidationError,
+    clear_memories,
+    delete_memory,
+    init_user_memory_schema,
+    list_memories,
+    upsert_memory,
+)
 ph = PasswordHasher()
 # ================== DeepSeek API Key ==================
 API_KEY = load_env_var("DEEPSEEK_API_KEY")
@@ -103,33 +113,37 @@ translation_prompt = ChatPromptTemplate.from_messages([
 translation_chain = translation_prompt | generator_llm
 
 # ================== SQLite 数据库 ==================
-DB_FILE = "chat_history.db"
+DB_FILE = PROJECT_DIR / "chat_history.db"
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            type TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DATETIME NOT NULL
-        )
-    ''')
-    columns = {row[1] for row in cursor.execute("PRAGMA table_info(chat_history)")}
-    if "japanese_content" not in columns:
-        cursor.execute("ALTER TABLE chat_history ADD COLUMN japanese_content TEXT")
-    if "audio_path" not in columns:
-        cursor.execute("ALTER TABLE chat_history ADD COLUMN audio_path TEXT")
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME NOT NULL
+            )
+        ''')
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(chat_history)")}
+        if "japanese_content" not in columns:
+            cursor.execute("ALTER TABLE chat_history ADD COLUMN japanese_content TEXT")
+        if "audio_path" not in columns:
+            cursor.execute("ALTER TABLE chat_history ADD COLUMN audio_path TEXT")
+        init_user_memory_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 init_db()
 
@@ -236,6 +250,167 @@ def render_portal_links():
         cols[index % 2].markdown(f"[{label}]({url})")
 
 
+MEMORY_CATEGORY_LABELS = {
+    "preferred_name": "希望使用的称呼",
+    "interest": "兴趣",
+    "conversation_preference": "聊天偏好",
+    "goal": "目标",
+}
+
+
+def memory_category_label(category):
+    return MEMORY_CATEGORY_LABELS.get(category, category)
+
+
+def set_memory_notice(username, message, level="success"):
+    st.session_state[f"memory_notice_{username}"] = (level, message)
+
+
+def render_memory_sidebar(username):
+    notice = st.session_state.pop(f"memory_notice_{username}", None)
+    try:
+        memories = list_memories(DB_FILE, username)
+        memory_store_available = True
+    except Exception:
+        memories = []
+        memory_store_available = False
+    category_options = sorted(MEMORY_CATEGORIES)
+
+    with st.sidebar.expander("我的聊天记忆", expanded=False):
+        st.caption("你可以决定让我长期记住什么；这里的内容不会自动从聊天中提取。")
+        st.caption("与当前话题相关的记忆会随本轮消息发送给 DeepSeek，用于个性化回复。")
+        st.warning("请不要保存密码、住址、联系方式、证件号码或其他敏感信息。")
+        if not memory_store_available:
+            st.error("暂时无法读取聊天记忆；普通聊天仍可继续。")
+            return
+
+        if notice:
+            level, message = notice
+            if level == "error":
+                st.error(message)
+            else:
+                st.success(message)
+
+        with st.form(f"memory_add_{username}", clear_on_submit=True):
+            category = st.selectbox(
+                "类型",
+                category_options,
+                format_func=memory_category_label,
+            )
+            memory_key = st.text_input(
+                "记忆名称",
+                placeholder="例如：喜欢的称呼",
+                max_chars=80,
+            )
+            memory_value = st.text_area(
+                "希望记住的内容",
+                placeholder="例如：希望被叫作白菜",
+                max_chars=500,
+            )
+            save_new = st.form_submit_button("保存这条记忆", use_container_width=True)
+
+        if save_new:
+            clean_key = memory_key.strip()
+            clean_value = memory_value.strip()
+            if not clean_key or not clean_value:
+                st.error("请把记忆名称和内容都填写完整。")
+            else:
+                try:
+                    upsert_memory(
+                        DB_FILE,
+                        username,
+                        category,
+                        clean_key,
+                        clean_value,
+                    )
+                    set_memory_notice(
+                        username,
+                        "已经记住啦。同一类型和名称再次保存时，会更新原来的内容。",
+                    )
+                    st.rerun()
+                except UserMemoryLimitError:
+                    st.error("每个账号最多保存 50 条记忆；请先删除一条再添加。")
+                except UserMemoryValidationError:
+                    st.error("这条记忆的类型、名称或内容不符合保存要求。")
+                except Exception:
+                    st.error("这条记忆暂时没有保存成功，请稍后再试。")
+
+        st.caption("同一类型和名称再次保存，会更新原来的内容。")
+        st.divider()
+
+        if not memories:
+            st.caption("还没有保存任何聊天记忆。")
+        else:
+            st.markdown("**已经保存**")
+            for memory in memories:
+                st.markdown(
+                    f"**{memory_category_label(memory.category)} · {memory.memory_key}**"
+                )
+                edited_value = st.text_area(
+                    "记忆内容",
+                    value=memory.memory_value,
+                    key=f"memory_value_{username}_{memory.id}",
+                    label_visibility="collapsed",
+                    max_chars=500,
+                )
+                update_col, delete_col = st.columns(2)
+                if update_col.button(
+                    "保存修改",
+                    key=f"memory_update_{username}_{memory.id}",
+                    use_container_width=True,
+                ):
+                    clean_value = edited_value.strip()
+                    if not clean_value:
+                        st.error("记忆内容不能为空；如果不再需要，请使用永久删除。")
+                    else:
+                        try:
+                            upsert_memory(
+                                DB_FILE,
+                                username,
+                                memory.category,
+                                memory.memory_key,
+                                clean_value,
+                            )
+                            set_memory_notice(username, "这条记忆已经更新。")
+                            st.rerun()
+                        except UserMemoryValidationError:
+                            st.error("记忆内容不符合保存要求。")
+                        except Exception:
+                            st.error("这条记忆暂时没有更新成功，请稍后再试。")
+                if delete_col.button(
+                    "永久删除",
+                    key=f"memory_delete_{username}_{memory.id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        delete_memory(DB_FILE, username, memory.id)
+                        set_memory_notice(username, "这条记忆已经永久删除。")
+                        st.rerun()
+                    except Exception:
+                        st.error("这条记忆暂时没有删除成功，请稍后再试。")
+                st.divider()
+
+            clear_version_key = f"memory_clear_version_{username}"
+            clear_version = st.session_state.get(clear_version_key, 0)
+            confirm_clear = st.checkbox(
+                "我确认要永久删除全部聊天记忆",
+                key=f"memory_clear_confirm_{username}_{clear_version}",
+            )
+            if st.button(
+                "清空全部记忆",
+                key=f"memory_clear_all_{username}_{clear_version}",
+                disabled=not confirm_clear,
+                use_container_width=True,
+            ):
+                try:
+                    clear_memories(DB_FILE, username)
+                    st.session_state[clear_version_key] = clear_version + 1
+                    set_memory_notice(username, "全部聊天记忆已经永久删除。")
+                    st.rerun()
+                except Exception:
+                    st.error("暂时无法清空记忆，请稍后再试。")
+
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.username = None
@@ -276,6 +451,8 @@ else:
         st.session_state.authenticated = False
         st.session_state.username = None
         st.rerun()
+
+    render_memory_sidebar(st.session_state.username)
 
     tts_enabled = is_tts_enabled()
     if "auto_tts" not in st.session_state:
@@ -341,7 +518,19 @@ else:
         with st.chat_message("assistant"):
             with st.spinner("阳菜在思考中...🥹"):
                 try:
-                    pipeline_result = persona_pipeline.respond(user_input, history.messages)
+                    try:
+                        current_user_memories = list_memories(
+                            DB_FILE,
+                            st.session_state.username,
+                        )
+                    except Exception:
+                        current_user_memories = []
+                        st.warning("本轮暂时无法读取长期记忆，将按普通对话继续。")
+                    pipeline_result = persona_pipeline.respond(
+                        user_input,
+                        history.messages,
+                        user_memories=current_user_memories,
+                    )
                     response_text = pipeline_result.content
                 except (APIConnectionError, APITimeoutError):
                     st.error("暂时无法连接 DeepSeek，请稍后再试。应用会自动重试连接。")

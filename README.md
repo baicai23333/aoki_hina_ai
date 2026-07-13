@@ -6,6 +6,7 @@ Streamlit chat app for a non-official fan-created AI character inspired by Aoki 
 
 - Streamlit login and registration UI
 - SQLite-backed user and chat history storage
+- User-controlled structured memory with per-account isolation and hard delete
 - DeepSeek chat model through LangChain
 - A five-stage persona pipeline with deterministic safety routing
 - A verified source registry with explicit quarantine states
@@ -38,6 +39,7 @@ The main response path is:
 ```text
 user input
   -> deterministic scene classification
+  -> select up to six relevant, user-saved memories for ordinary chat only
   -> verified source and evidence retrieval
   -> public fact question: deterministic rendering from verified claims
   -> other scenes: DeepSeek planning and styled generation
@@ -80,6 +82,14 @@ Use `--json` for a machine-readable report. The evaluator scores routing, fact r
 ```
 
 See `persona/EVALUATION.md` for the schema, distribution, and current scope. Final-response helpfulness, naturalness, and Japanese translation fidelity require a separate live-model evaluation and are not claimed by this offline score.
+
+## User-controlled memory
+
+Signed-in users can explicitly add, update, and permanently delete four kinds of structured memory: preferred name, interests, goals, and conversation preferences. The app does not infer or save memories from chat history automatically. Reads and mutations are always scoped to the current username, and each account can store at most 50 entries.
+
+For ordinary chat, the pipeline selects at most six items. Preferred names and conversation preferences are prioritized; interests and goals are used only when they overlap with the current topic. Public-fact answers, identity attacks, and private-information probes ignore user memory completely. Selected memories are labeled as untrusted user context and cannot support real-person facts or override identity and privacy rules.
+
+Memory is stored in the local, unencrypted `chat_history.db`. Selected entries are sent to DeepSeek with the current request. Deleting an entry prevents future use but does not erase existing chat records or TTS audio that may already contain related text. Do not store passwords, API keys, addresses, identity documents, medical or financial data, or another person's private information.
 
 ## GPT-SoVITS Setup
 
