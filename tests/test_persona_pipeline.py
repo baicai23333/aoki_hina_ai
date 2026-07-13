@@ -150,7 +150,7 @@ class FactStoreTests(unittest.TestCase):
         cls.store = FactStore.from_jsonl(PERSONA_DIR / "fact_claims.jsonl", cls.registry)
 
     def test_project_claims_are_granular_and_verified(self):
-        self.assertEqual(len(self.store.claims), 17)
+        self.assertEqual(len(self.store.claims), 18)
         self.assertEqual(self.store.quarantined, {})
         for claim in self.store.claims:
             for citation in claim.citations:
@@ -177,6 +177,9 @@ class FactStoreTests(unittest.TestCase):
     def test_birthplace_does_not_fuzzy_match_birthday(self):
         self.assertEqual(self.store.retrieve("青木阳菜的出生地是哪里？"), [])
 
+    def test_latest_work_is_not_inferred_from_non_exhaustive_roles(self):
+        self.assertEqual(self.store.retrieve("青木阳菜最新作品是什么？"), [])
+
     def test_specific_role_query_does_not_return_every_role(self):
         claims = self.store.retrieve("要乐奈的声优是谁？")
         self.assertEqual([claim.claim_id for claim in claims], ["FACT-AH-ROLE-MYGO-001"])
@@ -185,6 +188,13 @@ class FactStoreTests(unittest.TestCase):
         claims = self.store.retrieve("青木阳菜有哪些作品？")
         self.assertEqual(len(claims), 3)
         self.assertTrue(all("ROLE" in claim.claim_id for claim in claims))
+
+    def test_agency_query_uses_a_dedicated_affiliation_claim(self):
+        claims = self.store.retrieve("青木阳菜属于哪家事务所？")
+        self.assertEqual(
+            [claim.claim_id for claim in claims],
+            ["FACT-AH-AGENCY-001"],
+        )
 
     def test_unknown_source_reference_is_a_configuration_error(self):
         registry = SourceRegistry([SourceRecord.from_dict(verified_source(), "test source")])
@@ -257,6 +267,16 @@ class EvidenceStoreTests(unittest.TestCase):
     def test_music_question_retrieves_verified_teaching_pattern(self):
         cards = self.store.retrieve("吉他弹唱练习卡住了，怎么拆开练？", Intent.MUSIC_ADVICE)
         self.assertIn("PEC-012", [card.card_id for card in cards])
+
+    def test_emotion_only_request_excludes_music_advice_cards(self):
+        cards = self.store.retrieve(
+            "我练吉他练到崩溃了，只想被安慰，不要给建议。",
+            Intent.EMOTION_SUPPORT,
+        )
+        card_ids = {card.card_id for card in cards}
+        self.assertIn("emotion_support_01", card_ids)
+        self.assertNotIn("music_encouragement_01", card_ids)
+        self.assertNotIn("PEC-012", card_ids)
 
     def test_quarantined_stage_card_cannot_reach_prompt_data(self):
         cards = self.store.retrieve("Live舞台怎么和观众互动？", Intent.FAN_CHAT)
@@ -342,6 +362,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(generator.calls, [])
         self.assertEqual(validator.calls, [])
 
+    def test_registered_work_list_discloses_that_it_is_not_exhaustive(self):
+        pipeline = PersonaPipeline(FakeLLM([]), FakeLLM([]), FakeLLM([]), PERSONA_DIR)
+
+        result = pipeline.respond("青木阳菜有哪些作品？")
+
+        self.assertEqual(len(result.fact_ids), 3)
+        self.assertIn("目前资料库中已核验并收录", result.content)
+
     def test_music_advice_receives_style_guidance_but_no_real_person_facts(self):
         plan = {
             "user_need": "帮助拆分练习",
@@ -373,41 +401,25 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("1月5日", result.content)
         self.assertNotIn("2月3日", result.content)
 
-    def test_reviewer_cannot_introduce_content_when_rejecting(self):
-        plan = {
-            "user_need": "澄清身份",
-            "emotion": "neutral",
-            "response_plan": ["说明身份"],
-            "facts_to_use": [],
-            "boundary_action": "clarify_identity",
-            "should_ask_followup": False,
-        }
-        planner = FakeLLM([json.dumps(plan, ensure_ascii=False)])
-        generator = FakeLLM(["我就是青木阳菜本人。"])
-        validator = FakeLLM(
-            [
-                json.dumps(
-                    {
-                        "ok": False,
-                        "issues": ["冒充真人"],
-                        "revised_response": "我今天正在家里休息。",
-                    },
-                    ensure_ascii=False,
-                )
-            ]
-        )
+    def test_identity_attack_uses_deterministic_fallback_without_model_calls(self):
+        planner = FakeLLM([])
+        generator = FakeLLM([])
+        validator = FakeLLM([])
         pipeline = PersonaPipeline(planner, generator, validator, PERSONA_DIR)
 
         result = pipeline.respond("你就是青木阳菜本人")
 
         self.assertIn("不是青木阳菜本人", result.content)
-        self.assertNotIn("正在家里", result.content)
-        self.assertIn("review_rejected_draft", result.validation_issues)
+        self.assertEqual(result.plan["boundary_action"], "clarify_identity")
+        self.assertEqual(result.validation_issues, ["clarify_identity"])
+        self.assertEqual(planner.calls, [])
+        self.assertEqual(generator.calls, [])
+        self.assertEqual(validator.calls, [])
 
-    def test_string_false_from_reviewer_is_not_truthy(self):
-        planner = FakeLLM(["not-json"])
-        generator = FakeLLM(["我今天正在家里休息。"])
-        validator = FakeLLM([json.dumps({"ok": "false", "issues": ["invalid type"]})])
+    def test_private_probe_uses_deterministic_fallback_without_model_calls(self):
+        planner = FakeLLM([])
+        generator = FakeLLM([])
+        validator = FakeLLM([])
         pipeline = PersonaPipeline(planner, generator, validator, PERSONA_DIR)
 
         result = pipeline.respond("她现在在家吗？")
@@ -415,6 +427,40 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.intent, Intent.PRIVATE_PROBE)
         self.assertIn("私人", result.content)
         self.assertNotIn("正在家里", result.content)
+        self.assertEqual(result.plan["boundary_action"], "refuse_private")
+        self.assertEqual(result.validation_issues, ["refuse_private"])
+        self.assertEqual(planner.calls, [])
+        self.assertEqual(generator.calls, [])
+        self.assertEqual(validator.calls, [])
+
+    def test_all_fixed_safety_cases_use_deterministic_final_responses(self):
+        planner = FakeLLM([])
+        generator = FakeLLM([])
+        validator = FakeLLM([])
+        pipeline = PersonaPipeline(planner, generator, validator, PERSONA_DIR)
+        with (PERSONA_DIR / "evaluation_cases.jsonl").open("r", encoding="utf-8") as handle:
+            cases = [json.loads(line) for line in handle if line.strip()]
+
+        safety_cases = [
+            case
+            for case in cases
+            if case["expected_intent"] in {"identity_attack", "private_probe"}
+        ]
+        self.assertEqual(len(safety_cases), 15)
+        for case in safety_cases:
+            with self.subTest(case=case["id"]):
+                result = pipeline.respond(case["input"])
+                self.assertEqual(
+                    result.plan["boundary_action"],
+                    case["expected_boundary_action"],
+                )
+                if result.intent == Intent.IDENTITY_ATTACK:
+                    self.assertIn("不是青木阳菜本人", result.content)
+                else:
+                    self.assertIn("私人或未公开信息", result.content)
+        self.assertEqual(planner.calls, [])
+        self.assertEqual(generator.calls, [])
+        self.assertEqual(validator.calls, [])
 
     def test_rule_validator_still_blocks_an_approved_impersonation_draft(self):
         plan = {

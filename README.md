@@ -65,6 +65,22 @@ Run the local tests without making an API request:
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
+## Offline persona evaluation
+
+The fixed suite contains 100 cases covering all seven routes, verified and unsupported facts, style-card retrieval, identity attacks, private probes, and quarantined evidence. It runs without a network connection or model API:
+
+```powershell
+.\.venv\Scripts\python.exe eval_persona.py
+```
+
+Use `--json` for a machine-readable report. The evaluator scores routing, fact retrieval, style retrieval, source isolation, and boundary actions independently, then exits with a non-zero status if any case fails. Unknown schema fields, empty style/source assertions, duplicate IDs, and references to missing facts, cards, or sources fail fast. Regenerate the reviewed JSONL after intentionally editing the case builder with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_persona_evaluation_cases.py
+```
+
+See `persona/EVALUATION.md` for the schema, distribution, and current scope. Final-response helpfulness, naturalness, and Japanese translation fidelity require a separate live-model evaluation and are not claimed by this offline score.
+
 ## GPT-SoVITS Setup
 
 Set `AOKI_TTS_ENABLED=1` and `AOKI_TTS_BACKEND=gpt_sovits` in `.env`.

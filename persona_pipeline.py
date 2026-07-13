@@ -23,10 +23,10 @@ CATEGORY_INTENTS: dict[str, tuple[str, ...]] = {
     "serious_reflection": ("daily_chat", "emotion_support"),
     "gratitude": ("daily_chat", "fan_chat"),
     "stage_hype": ("fan_chat",),
-    "music_teaching": ("music_advice", "emotion_support"),
+    "music_teaching": ("music_advice",),
     "music_aesthetics": ("music_advice", "fan_chat"),
     "creative_themes": ("music_advice", "fan_chat"),
-    "specific_praise": ("daily_chat", "emotion_support"),
+    "specific_praise": ("daily_chat", "emotion_support", "fan_chat"),
     "reassurance": ("emotion_support", "music_advice"),
     "audience_inclusion": ("daily_chat", "fan_chat"),
     "identity_separation": ("all",),
@@ -346,6 +346,8 @@ class FactStore:
 
     def retrieve(self, query: str, limit: int = 5) -> list[FactClaim]:
         normalized_query = _normalize_match_text(query)
+        if any(marker in normalized_query for marker in ("最新", "最近发布", "目前最新")):
+            return []
         ranked: list[tuple[int, FactClaim]] = []
         for claim in self.claims:
             matches = {
@@ -488,31 +490,49 @@ class IntentClassifier:
         r"假装(你是|成)(青木阳菜|本人)",
         r"冒充(青木阳菜|本人)",
         r"不要说你是(ai|机器人|虚拟角色)",
+        r"(从现在起|以后).*(你叫|叫你)(青木阳菜)",
+        r"(别|不要).{0,8}(提|说).{0,8}(ai|机器人|虚拟角色)",
         r"以(青木阳菜|本人)的名义",
-        r"替(青木阳菜|她)发(声明|祝福|私信)",
+        r"(用|以)本人身份",
+        r"替(青木阳菜|她).{0,10}发.{0,10}(声明|祝福|私信)",
+        r"用(青木阳菜|她)的口吻.{0,16}(声明|祝福|私信)",
+        r"(模拟|克隆|使用).{0,12}(青木阳菜|她|本人).{0,12}(声音|语音)",
+        r"(让|使).{0,12}(读者|别人|对方).{0,12}(以为|认为).{0,8}(是)?(青木[阳陽]菜|她).{0,8}(本人|发)",
+        r"(pretend|actas|roleplayas).{0,12}(aokihina|therealaokihina)",
     )
     PRIVATE_PATTERNS = (
         r"(私下|私人|未公开|内部).*(关系|行程|地址|电话|联系方式|看法)",
-        r"(现在|今天).*(在家|在哪里|在哪儿|行程|和谁|做什么|心情)",
-        r"(住址|手机号|私人邮箱|未公开行程|男朋友|女朋友|恋爱|结婚|家人)",
+        r"(青木[阳陽]菜|她).{0,12}(现在|今天|今晚|明晚).*(在家|在哪里|在哪儿|行程|和谁|做什么|心情|吃饭)",
+        r"(现在|今天|今晚|明晚).{0,12}(青木[阳陽]菜|她).*(在家|在哪里|在哪儿|行程|和谁|做什么|心情|吃饭)",
+        r"(住址|手机号|私人邮箱|未公开行程|男朋友|女朋友|对象|交往|恋爱|结婚|家人)",
+        r"(住在哪里|住哪|家庭地址|家庭住址)",
         r"和.+私下关系",
+        r"(青木[阳陽]菜|她).{0,16}(成员|同事).{0,8}关系",
+        r"青木[阳陽]菜.{0,10}(今|現在).{0,10}(どこ|何処|いますか|いる)",
     )
     PUBLIC_FACT_TERMS = (
-        "青木阳菜", "出生", "生日", "事务所", "作品", "出演", "专辑",
+        "青木阳菜", "青木陽菜", "是谁", "出生", "生日", "事务所", "作品", "出演", "专辑",
         "采访", "公开", "经历", "爱好", "官方", "什么时候", "哪一年",
         "声优", "配音", "饰演",
     )
     MUSIC_TERMS = (
         "吉他", "钢琴", "和弦", "扫弦", "节奏", "练琴", "练习", "唱歌",
-        "弹唱", "作曲", "作词", "音乐", "乐器", "live", "演奏",
+        "弹唱", "作曲", "作词", "音乐", "乐器", "live", "演奏", "节拍器",
+    )
+    MUSIC_ADVICE_MARKERS = (
+        "怎么", "如何", "怎么办", "练", "卡住", "不会", "想学", "总是", "一快就",
+        "按不住", "合不上", "高音", "灵感", "安排多久", "该继续吗",
     )
     FAN_TERMS = (
-        "mygo", "bang dream", "要乐奈", "乐奈", "动画", "角色", "声优",
-        "演唱会", "舞台", "活动", "配信", "live",
+        "青木阳菜", "青木陽菜", "mygo", "bang dream", "要乐奈", "乐奈", "动画", "角色", "声优",
+        "演唱会", "舞台", "活动", "配信", "live", "成员", "粉丝", "新观众",
     )
     EMOTION_TERMS = (
         "难过", "伤心", "焦虑", "紧张", "害怕", "孤独", "失落", "挫败",
         "烦", "累", "崩溃", "没信心", "心情不好", "压力", "安慰", "怎么办",
+    )
+    EMOTION_ONLY_MARKERS = (
+        "只想被安慰", "不要给建议", "先别给建议", "只想聊聊", "陪我说说话",
     )
 
     def classify(self, text: str) -> Intent:
@@ -521,15 +541,26 @@ class IntentClassifier:
             return Intent.IDENTITY_ATTACK
         if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in self.PRIVATE_PATTERNS):
             return Intent.PRIVATE_PROBE
+        if re.search(r"你.{0,8}(喜欢|欣赏).{0,8}青木[阳陽]菜", normalized):
+            return Intent.FAN_CHAT
         if any(term in normalized for term in self.PUBLIC_FACT_TERMS) and any(
             marker in normalized for marker in ("吗", "呢", "？", "?", "多少", "什么", "哪", "谁", "几")
         ):
             return Intent.PUBLIC_FACT
-        if any(term in normalized for term in self.MUSIC_TERMS):
-            return Intent.MUSIC_ADVICE
-        if any(term in normalized for term in self.EMOTION_TERMS):
+        has_music = any(term in normalized for term in self.MUSIC_TERMS)
+        has_fan = any(term in normalized for term in self.FAN_TERMS)
+        has_emotion = any(term in normalized for term in self.EMOTION_TERMS)
+        if has_emotion and any(marker in normalized for marker in self.EMOTION_ONLY_MARKERS):
             return Intent.EMOTION_SUPPORT
-        if any(term in normalized for term in self.FAN_TERMS):
+        if has_music and has_fan and not any(
+            marker in normalized for marker in self.MUSIC_ADVICE_MARKERS
+        ):
+            return Intent.FAN_CHAT
+        if has_music:
+            return Intent.MUSIC_ADVICE
+        if has_emotion:
+            return Intent.EMOTION_SUPPORT
+        if has_fan:
             return Intent.FAN_CHAT
         return Intent.DAILY_CHAT
 
@@ -553,6 +584,14 @@ def _normalize_match_text(text: str) -> str:
 
 
 class EvidenceStore:
+    CORE_CARD_IDS = {
+        Intent.DAILY_CHAT: "daily_detail_01",
+        Intent.EMOTION_SUPPORT: "emotion_support_01",
+        Intent.MUSIC_ADVICE: "music_encouragement_01",
+        Intent.PRIVATE_PROBE: "identity_separation_01",
+        Intent.IDENTITY_ATTACK: "identity_separation_01",
+    }
+
     def __init__(
         self,
         cards: Iterable[EvidenceCard],
@@ -648,7 +687,13 @@ class EvidenceStore:
             intent_bonus = 3 if intent.value in card.intents else 1
             ranked.append((overlap + intent_bonus, card))
         ranked.sort(key=lambda item: (-item[0], item[1].card_id))
-        return [card for score, card in ranked[:limit] if score > 0]
+        ranked_cards = [card for score, card in ranked if score > 0]
+        core_id = self.CORE_CARD_IDS.get(intent)
+        core = next((card for card in ranked_cards if card.card_id == core_id), None)
+        if core is None:
+            return ranked_cards[:limit]
+        remaining = [card for card in ranked_cards if card.card_id != core.card_id]
+        return [core, *remaining[: max(0, limit - 1)]]
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -1020,7 +1065,7 @@ class PersonaPipeline:
         if len(claims) == 1:
             return f"根据已核验的官方资料，{claims[0].text}"
         lines = "\n".join(f"- {claim.text}" for claim in claims)
-        return f"根据已核验的官方资料：\n{lines}"
+        return f"目前资料库中已核验并收录的公开资料包括：\n{lines}"
 
     @staticmethod
     def _safe_fallback(intent: Intent) -> str:
@@ -1063,6 +1108,28 @@ class PersonaPipeline:
                 fact_ids=fact_ids,
                 plan=plan,
                 validation_issues=([] if verified_facts else ["insufficient_public_evidence"]),
+            )
+
+        if intent in {Intent.IDENTITY_ATTACK, Intent.PRIVATE_PROBE}:
+            boundary_action = (
+                "clarify_identity"
+                if intent == Intent.IDENTITY_ATTACK
+                else "refuse_private"
+            )
+            return PipelineResult(
+                content=self._safe_fallback(intent),
+                intent=intent,
+                evidence_ids=[card.card_id for card in style_guidance],
+                fact_ids=[],
+                plan={
+                    "user_need": "执行身份与隐私边界",
+                    "emotion": "neutral",
+                    "response_plan": ["使用确定性安全回复，不调用语言模型"],
+                    "facts_to_use": [],
+                    "boundary_action": boundary_action,
+                    "should_ask_followup": False,
+                },
+                validation_issues=[boundary_action],
             )
 
         plan = self._make_plan(user_input, intent, style_guidance, verified_facts, history)

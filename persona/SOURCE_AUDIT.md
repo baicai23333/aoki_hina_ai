@@ -12,7 +12,7 @@ Audit date: 2026-07-14
 | Rejected | 3 |
 | Fact-eligible sources | 2 |
 | Style-eligible sources | 17 |
-| Active granular fact claims | 17 |
+| Active granular fact claims | 18 |
 | Active imported style cards | 10 |
 | Quarantined imported style cards | 8 |
 | Original Hina Bot policy cards | 4 |

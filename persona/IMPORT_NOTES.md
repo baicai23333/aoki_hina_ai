@@ -19,7 +19,7 @@ The source persona said both that this is a non-official bot and that, when aske
 
 The imported `PEC-*` cards reference `SRC-01` through `SRC-50`. The evidence-card artifact itself did not contain URLs, page numbers, program timestamps, or screenshots, so no reference was trusted merely because it had a high confidence label.
 
-The original 50-block corpus was later recovered and compared with accessible primary pages. As of 2026-07-14, the registry contains 52 records: 20 verified, 29 unverified, and 3 rejected. Ten imported style cards have enough verified support to be active; eight remain quarantined. The three former compound fact cards were removed and replaced by 17 granular claims backed by two official, fact-eligible pages.
+The original 50-block corpus was later recovered and compared with accessible primary pages. As of 2026-07-14, the registry contains 52 records: 20 verified, 29 unverified, and 3 rejected. Ten imported style cards have enough verified support to be active; eight remain quarantined. The three former compound fact cards were removed and replaced by 18 granular claims backed by two official, fact-eligible pages.
 
 `SRC-40` and `SRC-46` were rejected because the claimed quotations could not be found anywhere in the three-page LisAni interview. `SRC-08` was rejected because Wikipedia had been misclassified as official material. See `SOURCE_AUDIT.md` for the complete snapshot.
 
