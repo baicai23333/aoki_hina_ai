@@ -28,6 +28,7 @@ _VALIDATION_CODES = {
     "unsupported_real_person_fact",
     "excessive_exclamation_marks",
     "unexpected_japanese_output",
+    "hidden_or_redacted_content",
     "empty_or_too_short",
 }
 _TRANSLATION_STATUSES = {

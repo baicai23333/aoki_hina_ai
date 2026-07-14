@@ -370,6 +370,21 @@ class RuleValidatorTests(unittest.TestCase):
             validator.validate("我很喜欢《君の名は》。", Intent.FAN_CHAT),
         )
 
+    def test_blocks_hidden_or_redacted_primary_output(self):
+        validator = RuleValidator()
+        cases = (
+            "正常内容~~不应继续传播的内容~~结束。",
+            "正常内容<!-- hidden -->结束。",
+            "正常内容<del>已删除</del>结束。",
+            "正常内容[已屏蔽]结束。",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertIn(
+                    "hidden_or_redacted_content",
+                    validator.validate(text, Intent.DAILY_CHAT),
+                )
+
 
 class PipelineTests(unittest.TestCase):
     def test_unknown_public_fact_short_circuits_without_model_calls(self):
@@ -472,6 +487,38 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.plan["boundary_action"], "none")
         self.assertFalse(result.plan["should_ask_followup"])
         self.assertNotIn("system_override", generator.prompt_text())
+
+    def test_ordinary_planner_cannot_select_a_safety_translation_route(self):
+        for requested_action in (
+            "clarify_identity",
+            "refuse_private",
+            "insufficient_public_evidence",
+        ):
+            with self.subTest(requested_action=requested_action):
+                plan = {
+                    "user_need": "普通聊天",
+                    "emotion": "neutral",
+                    "response_plan": ["自然回应"],
+                    "facts_to_use": [],
+                    "boundary_action": requested_action,
+                    "should_ask_followup": False,
+                }
+                planner = FakeLLM([json.dumps(plan, ensure_ascii=False)])
+                generator = FakeLLM(["今天也可以轻松聊聊天。"])
+                validator = FakeLLM(
+                    [json.dumps({"ok": True, "issues": []}, ensure_ascii=False)]
+                )
+                pipeline = PersonaPipeline(
+                    planner,
+                    generator,
+                    validator,
+                    PERSONA_DIR,
+                )
+
+                result = pipeline.respond("今天想随便聊聊。")
+
+                self.assertEqual(result.intent, Intent.DAILY_CHAT)
+                self.assertEqual(result.plan["boundary_action"], "none")
 
     def test_relevant_user_memories_reach_planner_and_generator_only(self):
         plan = {
@@ -742,6 +789,26 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIn("unexpected_japanese_output", result.validation_issues)
         self.assertNotIn("今日は", result.content)
+
+    def test_rule_validator_replaces_hidden_content_before_translation(self):
+        plan = {
+            "user_need": "聊天",
+            "emotion": "neutral",
+            "response_plan": ["回应"],
+            "facts_to_use": [],
+            "boundary_action": "none",
+            "should_ask_followup": False,
+        }
+        planner = FakeLLM([json.dumps(plan, ensure_ascii=False)])
+        generator = FakeLLM(["可以聊聊~~不应继续传播的内容~~音乐。"])
+        validator = FakeLLM([json.dumps({"ok": True, "issues": []})])
+        pipeline = PersonaPipeline(planner, generator, validator, PERSONA_DIR)
+
+        result = pipeline.respond("今天聊什么？")
+
+        self.assertIn("hidden_or_redacted_content", result.validation_issues)
+        self.assertNotIn("不应继续传播的内容", result.content)
+        self.assertNotIn("~~", result.content)
 
     def test_private_activity_is_blocked_even_in_daily_chat(self):
         plan = {

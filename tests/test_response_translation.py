@@ -11,6 +11,11 @@ from response_translation import (
     ResponseTranslationService,
     TranslationResult,
 )
+from safety_responses import (
+    IDENTITY_RESPONSE,
+    INSUFFICIENT_EVIDENCE_RESPONSE,
+    PRIVATE_RESPONSE,
+)
 
 
 class FakeLLM:
@@ -40,23 +45,32 @@ class FakeLLM:
 class ResponseTranslationServiceTests(unittest.TestCase):
     def test_fixed_safety_responses_never_call_models(self):
         cases = (
-            ("identity_attack", "none", FIXED_IDENTITY_RESPONSE),
-            ("daily_chat", "clarify_identity", FIXED_IDENTITY_RESPONSE),
-            ("private_probe", "none", FIXED_PRIVATE_RESPONSE),
-            ("daily_chat", "refuse_private", FIXED_PRIVATE_RESPONSE),
             (
+                IDENTITY_RESPONSE.chinese,
+                "identity_attack",
+                "none",
+                FIXED_IDENTITY_RESPONSE,
+            ),
+            (
+                PRIVATE_RESPONSE.chinese,
+                "private_probe",
+                "none",
+                FIXED_PRIVATE_RESPONSE,
+            ),
+            (
+                INSUFFICIENT_EVIDENCE_RESPONSE.chinese,
                 "public_fact",
                 "insufficient_public_evidence",
                 FIXED_INSUFFICIENT_EVIDENCE_RESPONSE,
             ),
         )
-        for intent, boundary_action, expected_text in cases:
+        for source, intent, boundary_action, expected_text in cases:
             with self.subTest(intent=intent, boundary=boundary_action):
                 translator = FakeLLM()
                 reviewer = FakeLLM()
                 service = ResponseTranslationService(translator, reviewer)
 
-                result = service.translate("模型不应该看到这段文字", intent, boundary_action)
+                result = service.translate(source, intent, boundary_action)
 
                 self.assertEqual(
                     result,
@@ -67,6 +81,93 @@ class ResponseTranslationServiceTests(unittest.TestCase):
                     ),
                 )
                 self.assertEqual(translator.calls, [])
+                self.assertEqual(reviewer.calls, [])
+
+    def test_fixed_safety_response_requires_the_matching_chinese_source(self):
+        translator = FakeLLM()
+        reviewer = FakeLLM()
+        service = ResponseTranslationService(translator, reviewer)
+
+        result = service.translate(
+            "这不是当前固定的中文安全回复。",
+            "identity_attack",
+            "clarify_identity",
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.issue_codes, ("fixed_source_mismatch",))
+        self.assertEqual(translator.calls, [])
+        self.assertEqual(reviewer.calls, [])
+
+    def test_ordinary_intent_cannot_select_unrelated_fixed_japanese(self):
+        source = "今天也聊聊音乐吧。"
+        candidate = "今日も音楽について話しましょう。"
+        for boundary_action in (
+            "clarify_identity",
+            "refuse_private",
+            "insufficient_public_evidence",
+        ):
+            with self.subTest(boundary_action=boundary_action):
+                translator = FakeLLM([candidate])
+                reviewer = FakeLLM([json.dumps({"ok": True, "issues": []})])
+                service = ResponseTranslationService(translator, reviewer)
+
+                result = service.translate(source, "daily_chat", boundary_action)
+
+                self.assertEqual(result.status, "validated")
+                self.assertEqual(result.text, candidate)
+                self.assertEqual(len(translator.calls), 1)
+                self.assertEqual(len(reviewer.calls), 1)
+
+    def test_hidden_or_redacted_source_is_never_translated(self):
+        sources = (
+            "今天聊聊~~不应继续传播的内容~~音乐吧。",
+            "今天聊聊<!-- hidden -->音乐吧。",
+            "今天聊聊[已删除]音乐吧。",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                translator = FakeLLM()
+                reviewer = FakeLLM()
+                service = ResponseTranslationService(translator, reviewer)
+
+                result = service.translate(source, "daily_chat", "none")
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.text, "")
+                self.assertEqual(
+                    result.issue_codes,
+                    ("source_hidden_or_redacted",),
+                )
+                self.assertEqual(translator.calls, [])
+                self.assertEqual(reviewer.calls, [])
+
+    def test_hidden_or_redacted_japanese_candidate_is_never_approved(self):
+        candidates = (
+            "今日は~~秘密~~について話しましょう。",
+            "今日は[削除済み]について話しましょう。",
+            "今日は秘̶密̶について話しましょう。",
+        )
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                translator = FakeLLM([candidate])
+                reviewer = FakeLLM()
+                service = ResponseTranslationService(translator, reviewer)
+
+                result = service.translate(
+                    "今天聊聊没有被隐藏的普通内容。",
+                    "daily_chat",
+                    "none",
+                )
+
+                self.assertEqual(result.status, "rejected")
+                self.assertEqual(result.text, "")
+                self.assertIn(
+                    "translation_hidden_or_redacted",
+                    result.issue_codes,
+                )
+                self.assertEqual(len(translator.calls), 1)
                 self.assertEqual(reviewer.calls, [])
 
     def test_safe_translation_is_validated_after_strict_review(self):

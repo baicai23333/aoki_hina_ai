@@ -6,7 +6,7 @@ from pathlib import Path
 from openai import APIConnectionError, APITimeoutError
 from langchain_deepseek import ChatDeepSeek
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
+from chat_history_context import build_model_history
 from chat_storage import (
     PLAYABLE_TRANSLATION_STATUSES,
     init_chat_storage_schema,
@@ -17,6 +17,7 @@ from chat_storage import (
 from chat_presentation import translation_status_message
 from pipeline_debug import build_debug_trace
 from persona_pipeline import PersonaPipeline
+from response_text_policy import has_hidden_or_redacted_content
 from response_translation import ResponseTranslationService, TranslationResult
 from tts_engine import TTSEngine, load_env_var, safe_cached_wav_path
 from user_memory import (
@@ -449,11 +450,8 @@ else:
         st.stop()
     history = StreamlitChatMessageHistory(key=f"chat_{username}")
     history.clear()
-    for record in stored_messages:
-        if record.type == "human":
-            history.add_message(HumanMessage(content=record.content))
-        elif record.type == "ai":
-            history.add_message(AIMessage(content=record.content))
+    for message in build_model_history(stored_messages):
+        history.add_message(message)
 
     st.caption("Hina Bot 是非官方粉丝创作 AI，不是青木阳菜本人；日语语音由 AI 合成。")
     st.caption("和阳菜聊点什么吧～🐈✨")
@@ -466,15 +464,29 @@ else:
                 st.markdown("**中文**")
                 st.write(record.content)
 
+                source_has_hidden_content = has_hidden_or_redacted_content(
+                    record.content
+                )
                 is_playable_translation = (
                     record.translation_status in PLAYABLE_TRANSLATION_STATUSES
+                    and not source_has_hidden_content
                 )
-                is_legacy_translation = record.translation_status == "legacy_unverified"
+                is_legacy_translation = (
+                    record.translation_status == "legacy_unverified"
+                    and not source_has_hidden_content
+                )
                 japanese_history = (
                     record.japanese_content
                     if is_playable_translation or is_legacy_translation
                     else None
                 )
+                if source_has_hidden_content:
+                    if st.session_state.get(pending_autoplay_key) == record.id:
+                        st.session_state.pop(pending_autoplay_key, None)
+                    st.warning(
+                        "这条中文包含隐藏、删除线或屏蔽标记；为避免双语内容不一致，"
+                        "已停用其日语和语音。"
+                    )
                 if japanese_history:
                     st.markdown("**日本語**")
                     st.write(japanese_history)
@@ -546,6 +558,12 @@ else:
                         user_memories=current_user_memories,
                     )
                     response_text = pipeline_result.content
+                    if has_hidden_or_redacted_content(response_text):
+                        st.error(
+                            "本轮回复包含无法安全呈现的隐藏或删除内容，"
+                            "已停止翻译和保存，请重新发送。"
+                        )
+                        st.stop()
                     if (
                         pipeline_result.intent.value
                         in {"daily_chat", "emotion_support", "music_advice", "fan_chat"}

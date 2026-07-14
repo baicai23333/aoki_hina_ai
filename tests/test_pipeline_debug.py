@@ -29,7 +29,11 @@ class PipelineDebugTests(unittest.TestCase):
                 "user_need": secret,
                 "response_plan": [secret],
             },
-            validation_issues=[secret, "review_rejected_draft"],
+            validation_issues=[
+                secret,
+                "review_rejected_draft",
+                "hidden_or_redacted_content",
+            ],
         )
 
         trace = build_debug_trace(
@@ -59,7 +63,11 @@ class PipelineDebugTests(unittest.TestCase):
         self.assertEqual(trace["memory_ids"], [3])
         self.assertEqual(
             trace["validation_codes"],
-            ["model_review_rejected", "review_rejected_draft"],
+            [
+                "model_review_rejected",
+                "review_rejected_draft",
+                "hidden_or_redacted_content",
+            ],
         )
         self.assertEqual(trace["stage_duration_ms"], {"pipeline": 13, "translation": 0})
         self.assertNotIn(secret, serialized)
