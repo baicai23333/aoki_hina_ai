@@ -14,6 +14,7 @@ from chat_storage import (
     save_exchange,
     update_message_audio as update_stored_message_audio,
 )
+from chat_presentation import translation_status_message
 from pipeline_debug import build_debug_trace
 from persona_pipeline import PersonaPipeline
 from response_translation import ResponseTranslationService, TranslationResult
@@ -479,6 +480,11 @@ else:
                     st.write(japanese_history)
                     if is_legacy_translation:
                         st.caption("旧版未复核译文：可以阅读，但不会用于语音播放。")
+                translation_notice = translation_status_message(
+                    record.translation_status
+                )
+                if translation_notice:
+                    st.warning(translation_notice)
 
                 verified_audio_path = (
                     safe_cached_wav_path(record.audio_path)
@@ -588,7 +594,11 @@ else:
                 st.markdown("**日本語**")
                 st.write(japanese_text)
             else:
-                st.warning("日语译文未通过本轮复核，这条消息仅显示中文。")
+                translation_notice = translation_status_message(
+                    translation_result.status
+                )
+                if translation_notice:
+                    st.warning(translation_notice)
 
             issue_code = (
                 translation_result.issue_codes[0]

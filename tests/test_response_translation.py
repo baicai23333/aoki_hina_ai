@@ -162,18 +162,23 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         cases = (
             (
                 "今天也聊聊音乐吧。",
-                "今日は3分だけ音楽について話しましょう。",
+                [
+                    "今日は3分だけ音楽について話しましょう。",
+                    "今日は3分だけ音楽について話しましょう。",
+                ],
                 ("digit_token_added",),
+                2,
             ),
             (
                 "资料日期是1月5日。",
-                "資料の日付は1月5日です。電話番号は09012345678です。",
+                ["資料の日付は1月5日です。電話番号は09012345678です。"],
                 ("digit_token_added", "private_information_added"),
+                1,
             ),
         )
-        for source, candidate, expected_issues in cases:
-            with self.subTest(candidate=candidate):
-                translator = FakeLLM([candidate])
+        for source, candidates, expected_issues, expected_calls in cases:
+            with self.subTest(candidate=candidates[0]):
+                translator = FakeLLM(candidates)
                 reviewer = FakeLLM()
                 service = ResponseTranslationService(translator, reviewer)
 
@@ -183,7 +188,84 @@ class ResponseTranslationServiceTests(unittest.TestCase):
                 self.assertEqual(result.text, "")
                 for issue in expected_issues:
                     self.assertIn(issue, result.issue_codes)
+                self.assertEqual(len(translator.calls), expected_calls)
                 self.assertEqual(reviewer.calls, [])
+
+    def test_retry_repairs_chinese_ordinal_then_runs_strict_review(self):
+        source = "弹到第三遍的时候，左手没按实。"
+        first_candidate = "3回目に弾いたとき、左手でしっかり押さえられませんでした。"
+        repaired_candidate = "三回目に弾いたとき、左手でしっかり押さえられませんでした。"
+        translator = FakeLLM([first_candidate, repaired_candidate])
+        reviewer = FakeLLM([json.dumps({"ok": True, "issues": []})])
+        service = ResponseTranslationService(translator, reviewer)
+
+        result = service.translate(source, "daily_chat", "none")
+
+        self.assertEqual(result.status, "validated")
+        self.assertEqual(result.text, repaired_candidate)
+        self.assertEqual(result.issue_codes, ())
+        self.assertEqual(len(translator.calls), 2)
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertIn("受限重译", str(translator.calls[1][0].content))
+        self.assertIn("三回目", str(translator.calls[1][0].content))
+        self.assertIn(source, str(translator.calls[1][1].content))
+        self.assertNotIn(first_candidate, str(translator.calls[1][1].content))
+
+    def test_repaired_candidate_is_checked_for_new_safety_violations(self):
+        source = "第3遍也继续练习。"
+        translator = FakeLLM(
+            [
+                "三回目も練習を続けます。",
+                "今は自宅にいます。3回目も練習を続けます。",
+            ]
+        )
+        reviewer = FakeLLM()
+        service = ResponseTranslationService(translator, reviewer)
+
+        result = service.translate(source, "daily_chat", "none")
+
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.issue_codes, ("private_information_added",))
+        self.assertEqual(len(translator.calls), 2)
+        self.assertEqual(reviewer.calls, [])
+
+    def test_retry_translation_exception_still_fails_closed(self):
+        translator = FakeLLM(
+            [
+                "今日は3分だけ音楽について話しましょう。",
+                RuntimeError("secret retry error"),
+            ]
+        )
+        reviewer = FakeLLM()
+        service = ResponseTranslationService(translator, reviewer)
+
+        result = service.translate("今天也聊聊音乐吧。", "daily_chat", "none")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.text, "")
+        self.assertEqual(result.issue_codes, ("translator_exception",))
+        self.assertNotIn("secret", repr(result))
+        self.assertEqual(len(translator.calls), 2)
+        self.assertEqual(reviewer.calls, [])
+
+    def test_retry_can_restore_an_ordinary_lost_negation(self):
+        translator = FakeLLM(
+            [
+                "今日は長時間練習しましょう。",
+                "今日はあまり長く練習しないでください。",
+            ]
+        )
+        reviewer = FakeLLM([json.dumps({"ok": True, "issues": []})])
+        service = ResponseTranslationService(translator, reviewer)
+
+        result = service.translate("今天不要练太久。", "music_advice", "none")
+
+        self.assertEqual(result.status, "validated")
+        self.assertEqual(result.text, "今日はあまり長く練習しないでください。")
+        self.assertEqual(result.issue_codes, ())
+        self.assertEqual(len(translator.calls), 2)
+        self.assertEqual(len(reviewer.calls), 1)
 
     def test_negative_phone_number_advice_is_not_treated_as_disclosure(self):
         candidate = "電話番号を共有しないでください。"
@@ -225,7 +307,7 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         )
         for source, candidate, expected_issue in cases:
             with self.subTest(issue=expected_issue):
-                translator = FakeLLM([candidate])
+                translator = FakeLLM([candidate, candidate])
                 reviewer = FakeLLM()
                 service = ResponseTranslationService(translator, reviewer)
 
@@ -234,6 +316,7 @@ class ResponseTranslationServiceTests(unittest.TestCase):
                 self.assertEqual(result.status, "rejected")
                 self.assertEqual(result.text, "")
                 self.assertIn(expected_issue, result.issue_codes)
+                self.assertEqual(len(translator.calls), 2)
                 self.assertEqual(reviewer.calls, [])
 
     def test_invalid_reviewer_json_or_schema_fails_closed(self):
@@ -309,13 +392,14 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         self.assertEqual(source_result.text, "")
         self.assertEqual(source_result.issue_codes, ("source_empty",))
 
-        translator = FakeLLM(["   "])
+        translator = FakeLLM(["   ", "   "])
         reviewer = FakeLLM()
         service = ResponseTranslationService(translator, reviewer)
         translation_result = service.translate("你好。", "daily_chat", "none")
         self.assertEqual(translation_result.status, "rejected")
         self.assertEqual(translation_result.text, "")
         self.assertEqual(translation_result.issue_codes, ("translation_empty",))
+        self.assertEqual(len(translator.calls), 2)
         self.assertEqual(reviewer.calls, [])
 
 
