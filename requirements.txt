@@ -2,6 +2,6 @@ argon2-cffi
 langchain-community
 langchain-core
 langchain-deepseek
-streamlit
+streamlit>=1.45,<2
 TTS
 requests

@@ -31,8 +31,44 @@ Edit `.env` and set `DEEPSEEK_API_KEY`.
 ## Run
 
 ```powershell
-streamlit run chat_client.py
+streamlit run app.py
 ```
+
+The default page remains the chat app. The protected management console is
+available from the sidebar or at `/admin`.
+
+## Management console
+
+The management console provides privacy-first site statistics, user search,
+translation and audio status, per-user maintenance actions, database health,
+and an audit trail. Chat text is not loaded or displayed by default.
+
+Create an Argon2 admin password hash, then add the printed value and a private
+admin username to `.env`:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\create_admin_password_hash.py
+```
+
+```text
+AOKI_ADMIN_USERNAME=your_admin_name
+AOKI_ADMIN_PASSWORD_HASH=the_generated_argon2_hash
+```
+
+Restart Streamlit after changing the admin configuration. To allow an
+administrator to explicitly load recent chat text, set
+`AOKI_ADMIN_ALLOW_MESSAGE_CONTENT=1`; every such access is written to the admin
+audit log. Destructive actions require typed confirmation and never delete
+cached audio files automatically. Password resets increment the account's
+session version, so already-open chat sessions are asked to sign in again.
+Deleting an account removes its chat and memory rows, while the audit log keeps
+the target username and deletion counts for accountability.
+
+For a public deployment, enforce request-rate limits for `/admin` at a trusted
+reverse proxy or edge service. The built-in failed-login cooldown is scoped to
+one browser session and is only a usability safeguard; Streamlit's reported
+client IP is not used as a security boundary. Use a unique admin password of at
+least 12 characters.
 
 ## Persona pipeline
 

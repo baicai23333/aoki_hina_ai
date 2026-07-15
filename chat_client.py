@@ -6,6 +6,11 @@ from pathlib import Path
 from openai import APIConnectionError, APITimeoutError
 from langchain_deepseek import ChatDeepSeek
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from account_auth import (
+    get_account_auth_version,
+    init_account_auth_schema,
+    verify_account,
+)
 from chat_history_context import build_model_history
 from chat_storage import (
     PLAYABLE_TRANSLATION_STATUSES,
@@ -103,7 +108,6 @@ translation_service = ResponseTranslationService(translator_llm, validator_llm)
 # ================== 安装 argon2（如果未安装会提示） ==================
 try:
     from argon2 import PasswordHasher
-    from argon2.exceptions import VerifyMismatchError
     ph = PasswordHasher()
 except ImportError:
     st.error("缺少 argon2-cffi 包，请在虚拟环境中运行：pip install argon2-cffi")
@@ -111,6 +115,7 @@ except ImportError:
 
 # ================== SQLite 数据库 ==================
 DB_FILE = PROJECT_DIR / "chat_history.db"
+MAX_USERNAME_LENGTH = 80
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -120,9 +125,11 @@ def init_db():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL
+                password_hash TEXT NOT NULL,
+                auth_version INTEGER NOT NULL DEFAULT 1 CHECK (auth_version >= 1)
             )
         ''')
+        init_account_auth_schema(conn)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,7 +164,7 @@ def is_debug_enabled():
 
 # ================== 用户函数（argon2） ==================
 def register_user(username, password):
-    if not username or not password:
+    if not username or len(username) > MAX_USERNAME_LENGTH or not password:
         return False
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -172,18 +179,11 @@ def register_user(username, password):
         conn.close()
 
 def verify_user(username, password):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        try:
-            ph.verify(row[0], password)
-            return True
-        except VerifyMismatchError:
-            return False
-    return False
+    return verify_account(DB_FILE, username, password, ph)
+
+
+def get_user_auth_version(username):
+    return get_account_auth_version(DB_FILE, username)
 
 # ================== Streamlit 界面 ==================
 PORTAL_LINKS = [
@@ -376,18 +376,26 @@ def render_debug_sidebar(username):
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.username = None
+    st.session_state.auth_version = None
 
 if not st.session_state.authenticated:
     st.title("🥹 青木阳菜AI Project")
     st.caption("喵喵喵 made by baicai")
     st.caption("非官方粉丝创作 AI，与青木阳菜本人及相关官方组织无关。")
     render_portal_links()
+    auth_notice = st.session_state.pop("auth_notice", None)
+    if auth_notice:
+        st.warning(auth_notice)
 
     tab_login, tab_register = st.tabs(["登录", "注册"])
 
     with tab_register:
         st.subheader("注册新账号")
-        reg_username = st.text_input("用户名", key="reg_user")
+        reg_username = st.text_input(
+            "用户名",
+            key="reg_user",
+            max_chars=MAX_USERNAME_LENGTH,
+        )
         reg_password = st.text_input("密码（支持中文/表情/任意长度）", type="password", key="reg_pass")
         if st.button("注册"):
             if register_user(reg_username.strip(), reg_password):
@@ -397,12 +405,18 @@ if not st.session_state.authenticated:
 
     with tab_login:
         st.subheader("登录")
-        login_username = st.text_input("用户名", key="login_user")
+        login_username = st.text_input(
+            "用户名",
+            key="login_user",
+            max_chars=MAX_USERNAME_LENGTH,
+        )
         login_password = st.text_input("密码", type="password", key="login_pass")
         if st.button("登录"):
-            if verify_user(login_username.strip(), login_password):
+            auth_version = verify_user(login_username.strip(), login_password)
+            if auth_version is not None:
                 st.session_state.authenticated = True
                 st.session_state.username = login_username.strip()
+                st.session_state.auth_version = auth_version
                 st.success(f"欢迎回来 {st.session_state.username}！🐈💙")
                 st.rerun()
             else:
@@ -410,6 +424,16 @@ if not st.session_state.authenticated:
 
 else:
     username = st.session_state.username
+    current_auth_version = get_user_auth_version(username)
+    if (
+        current_auth_version is None
+        or st.session_state.get("auth_version") != current_auth_version
+    ):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        st.session_state.auth_version = None
+        st.session_state.auth_notice = "账号登录状态已失效，请重新登录。"
+        st.rerun()
     auto_tts_key = f"auto_tts_{username}"
     pending_autoplay_key = f"pending_autoplay_message_id_{username}"
     tts_flash_key = f"tts_flash_error_{username}"
@@ -419,6 +443,7 @@ else:
         st.session_state.pop(tts_flash_key, None)
         st.session_state.authenticated = False
         st.session_state.username = None
+        st.session_state.auth_version = None
         st.rerun()
 
     render_memory_sidebar(username)
