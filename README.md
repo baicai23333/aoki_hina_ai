@@ -149,6 +149,14 @@ With `GPT_SOVITS_AUTO_START=1`, the chat app starts the configured local API whe
 ## Legacy XTTS Setup
 
 The project includes XTTS helper scripts and reference audio under `tts_xtts/`.
+Set `AOKI_TTS_USE_GPU=1` to run Coqui/XTTS on CUDA; startup fails clearly if the
+project environment cannot access CUDA instead of silently falling back to CPU.
+XTTS references should be clean, lossless, mono 22050 Hz speech clips totaling
+no more than 20 seconds. Generated cache/test audio is rejected as a reference.
+The stable XTTS v2 defaults are temperature `0.75`, top-k `50`, top-p `0.85`,
+repetition penalty `5.0`, and speed `1.0`. Sentence splitting prevents an early
+end token from dropping later sentences, while the XTTS model-level Japanese
+splitter also keeps long individual sentences inside its language-specific limit.
 
 ```bash
 ./tts_xtts/run_setup_xtts.sh

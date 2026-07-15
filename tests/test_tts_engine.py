@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import socket
@@ -6,6 +7,7 @@ import subprocess
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 from uuid import uuid4
@@ -83,6 +85,30 @@ class TTSEngineHardeningTests(unittest.TestCase):
             cache_max_bytes=cache_max_bytes,
         )
 
+    def make_xtts_config(self) -> tuple[TTSConfig, Path]:
+        ref_path = self.test_root / "clean-reference.wav"
+        frame_count = int(22_050 * 3.1)
+        pcm = b"\x00\x00" * frame_count
+        wav = (
+            b"RIFF"
+            + struct.pack("<I", 36 + len(pcm))
+            + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 22_050, 44_100, 2, 16)
+            + b"data"
+            + struct.pack("<I", len(pcm))
+            + pcm
+        )
+        ref_path.write_bytes(wav)
+        manifest = self.test_root / "refs.json"
+        manifest.write_text(json.dumps({"refs": [str(ref_path)]}), encoding="utf-8")
+        return replace(
+            self.make_config(),
+            backend="xtts",
+            model_name="tts_models/multilingual/multi-dataset/xtts_v2",
+            language="ja",
+            xtts_refs_manifest=manifest,
+        ), ref_path
+
     def test_get_defaults_gpt_sovits_output_language_to_ja(self):
         with patch.object(tts_engine, "load_env_var", side_effect=lambda key, default=None: default), patch.object(
             tts_engine, "DEFAULT_CACHE_DIR", self.cache_dir
@@ -92,10 +118,66 @@ class TTSEngineHardeningTests(unittest.TestCase):
         self.assertEqual(engine.config.gpt_sovits_output_language, "ja")
         self.assertEqual(engine.config.cache_max_files, tts_engine.DEFAULT_CACHE_MAX_FILES)
         self.assertEqual(engine.config.cache_max_bytes, tts_engine.DEFAULT_CACHE_MAX_BYTES)
+        self.assertFalse(engine.config.use_gpu)
+        self.assertEqual(engine.config.xtts_temperature, 0.75)
+        self.assertEqual(engine.config.xtts_top_k, 50)
+        self.assertEqual(engine.config.xtts_top_p, 0.85)
+        self.assertEqual(engine.config.xtts_repetition_penalty, 5.0)
+
+    def test_get_reads_gpu_switch(self):
+        with patch.object(
+            tts_engine,
+            "load_env_var",
+            side_effect=lambda key, default=None: "1" if key == "AOKI_TTS_USE_GPU" else default,
+        ), patch.object(tts_engine, "DEFAULT_CACHE_DIR", self.cache_dir):
+            engine = TTSEngine.get()
+
+        self.assertTrue(engine.config.use_gpu)
 
     def test_gpt_sovits_rejects_non_japanese_output_language(self):
         with self.assertRaisesRegex(RuntimeError, "Japanese-compatible"):
             TTSEngine(self.make_config(output_language="zh"))
+
+    def test_xtts_rejects_wrong_language_and_non_japanese_text(self):
+        config, _ = self.make_xtts_config()
+        with self.assertRaisesRegex(RuntimeError, "must be 'ja'"):
+            TTSEngine(replace(config, language="zh-cn"))
+
+        engine = TTSEngine(config)
+        with self.assertRaisesRegex(ValueError, "reviewed Japanese"):
+            engine.synthesize_to_file("这是中文文本")
+
+    def test_xtts_reference_contents_change_the_cache_key(self):
+        config, ref_path = self.make_xtts_config()
+        engine = TTSEngine(config)
+        first_key = engine._cache_key("こんばんは")
+        ref_path.write_bytes(ref_path.read_bytes()[:-2] + b"\x01\x00")
+        second_key = engine._cache_key("こんばんは")
+
+        self.assertNotEqual(first_key, second_key)
+
+    def test_xtts_passes_stable_parameters_and_uses_model_level_splitting(self):
+        config, _ = self.make_xtts_config()
+        engine = TTSEngine(config)
+        fake_tts = MagicMock()
+        fake_tts.synthesizer.tts.return_value = [0.0]
+        fake_tts.synthesizer.save_wav.side_effect = (
+            lambda wav, path: Path(path).write_bytes(valid_wav_bytes())
+        )
+
+        with patch.object(engine, "_load_model", return_value=fake_tts):
+            engine.synthesize_to_file("こんばんは。今日は何を話しましょうか？")
+
+        call = fake_tts.synthesizer.tts.call_args
+        self.assertEqual(call.kwargs["language_name"], "ja")
+        self.assertIsNone(call.kwargs["speaker_name"])
+        self.assertTrue(call.kwargs["split_sentences"])
+        self.assertTrue(call.kwargs["enable_text_splitting"])
+        self.assertEqual(call.kwargs["temperature"], 0.75)
+        self.assertEqual(call.kwargs["top_k"], 50)
+        self.assertEqual(call.kwargs["top_p"], 0.85)
+        self.assertEqual(call.kwargs["repetition_penalty"], 5.0)
+        self.assertEqual(call.kwargs["speed"], 1.0)
 
     def test_safe_cached_wav_path_accepts_only_valid_files_within_cache(self):
         valid_cached = self.cache_dir / "valid.wav"

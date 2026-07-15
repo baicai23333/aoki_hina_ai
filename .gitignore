@@ -13,8 +13,10 @@ venv311/
 
 .tts_models/
 tts_cache/
+tts_diagnostics/
 tts_xtts/work/
 tts_xtts/raw/
+tts_xtts/refs_clean/
 
 # Local GPT-SoVITS runtime, models, downloads, and generated audio
 GPT-SoVITS-package/

@@ -29,7 +29,7 @@ MIN_WAV_FILE_SIZE = 44
 WAV_VALIDATION_CHUNK_FRAMES = 16_384
 WAV_CONTENT_TYPES = frozenset({"audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave"})
 JAPANESE_GPT_SOVITS_LANGUAGES = frozenset({"ja", "all_ja"})
-CACHE_KEY_VERSION = "v2"
+CACHE_KEY_VERSION = "v5"
 TEMP_WAV_SUFFIXES = (".raw.wav", ".normalized.wav")
 _PROCESS_KEY_LOCKS_GUARD = threading.Lock()
 _PROCESS_KEY_LOCKS = {}
@@ -199,6 +199,12 @@ class TTSConfig:
     gpt_sovits_target_lufs: float
     cache_max_files: int = DEFAULT_CACHE_MAX_FILES
     cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
+    use_gpu: bool = False
+    xtts_temperature: float = 0.75
+    xtts_top_k: int = 50
+    xtts_top_p: float = 0.85
+    xtts_repetition_penalty: float = 5.0
+    xtts_speed: float = 1.0
 
 
 class TTSEngine:
@@ -211,6 +217,21 @@ class TTSEngine:
             value = getattr(self.config, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise RuntimeError(f"{field_name} must be a positive integer.")
+        if self.config.backend == "xtts":
+            if self.config.language != "ja":
+                raise RuntimeError("AOKI_XTTS_LANGUAGE must be 'ja' for Japanese TTS.")
+            if not 0.1 <= self.config.xtts_temperature <= 1.0:
+                raise RuntimeError("AOKI_XTTS_TEMPERATURE must be between 0.1 and 1.0.")
+            if not 1 <= self.config.xtts_top_k <= 100:
+                raise RuntimeError("AOKI_XTTS_TOP_K must be between 1 and 100.")
+            if not 0.1 <= self.config.xtts_top_p <= 1.0:
+                raise RuntimeError("AOKI_XTTS_TOP_P must be between 0.1 and 1.0.")
+            if not 1.0 <= self.config.xtts_repetition_penalty <= 15.0:
+                raise RuntimeError(
+                    "AOKI_XTTS_REPETITION_PENALTY must be between 1.0 and 15.0."
+                )
+            if not 0.75 <= self.config.xtts_speed <= 1.25:
+                raise RuntimeError("AOKI_XTTS_SPEED must be between 0.75 and 1.25.")
         self._gpt_sovits_output_language = (
             self.config.gpt_sovits_output_language or ""
         ).strip().lower()
@@ -254,6 +275,12 @@ class TTSEngine:
             speaker_name = load_env_var("AOKI_XTTS_SPEAKER_NAME", "MyVoice")
             language = load_env_var("AOKI_XTTS_LANGUAGE", "ja")
             xtts_use_cached_voice = (load_env_var("AOKI_XTTS_USE_CACHED_VOICE", "0") or "0").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            use_gpu = (load_env_var("AOKI_TTS_USE_GPU", "0") or "0").strip().lower() in {
                 "1",
                 "true",
                 "yes",
@@ -317,6 +344,14 @@ class TTSEngine:
                 cache_max_bytes=_positive_int_env(
                     "AOKI_TTS_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES
                 ),
+                use_gpu=use_gpu,
+                xtts_temperature=float(load_env_var("AOKI_XTTS_TEMPERATURE", "0.75")),
+                xtts_top_k=int(load_env_var("AOKI_XTTS_TOP_K", "50")),
+                xtts_top_p=float(load_env_var("AOKI_XTTS_TOP_P", "0.85")),
+                xtts_repetition_penalty=float(
+                    load_env_var("AOKI_XTTS_REPETITION_PENALTY", "5.0")
+                ),
+                xtts_speed=float(load_env_var("AOKI_XTTS_SPEED", "1.0")),
             )
             cls._instance = TTSEngine(config)
         return cls._instance
@@ -425,6 +460,11 @@ class TTSEngine:
         return wav_path.with_name(f".{wav_path.stem}.{uuid4().hex}.{stage}.wav")
 
     def _cache_key(self, cleaned_text: str) -> str:
+        xtts_ref_fingerprints = ()
+        if self.config.backend == "xtts" and not self.config.xtts_use_cached_voice:
+            xtts_ref_fingerprints = tuple(
+                _file_fingerprint(Path(path)) for path in self._load_xtts_refs()
+            )
         components = (
             CACHE_KEY_VERSION,
             self.config.backend,
@@ -432,8 +472,15 @@ class TTSEngine:
             self.config.speaker_name,
             self.config.language,
             str(self.config.xtts_use_cached_voice),
+            str(self.config.use_gpu),
+            str(self.config.xtts_temperature),
+            str(self.config.xtts_top_k),
+            str(self.config.xtts_top_p),
+            str(self.config.xtts_repetition_penalty),
+            str(self.config.xtts_speed),
             str(self.config.xtts_refs_manifest.resolve(strict=False)),
             _file_fingerprint(self.config.xtts_refs_manifest),
+            *xtts_ref_fingerprints,
             self.config.gpt_sovits_api_url,
             str(self.config.gpt_sovits_reference_audio.resolve(strict=False)),
             _file_fingerprint(self.config.gpt_sovits_reference_audio),
@@ -454,7 +501,18 @@ class TTSEngine:
                 from TTS.api import TTS
             except ImportError as exc:
                 raise RuntimeError("Coqui TTS is not installed. Install TTS in the project venv.") from exc
-            self._tts = TTS(model_name=self.config.model_name, progress_bar=False, gpu=False)
+            if self.config.use_gpu:
+                try:
+                    import torch
+                except ImportError as exc:
+                    raise RuntimeError("PyTorch is not installed; GPU TTS cannot start.") from exc
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "AOKI_TTS_USE_GPU=1, but CUDA is unavailable in the project venv."
+                    )
+            self._tts = TTS(model_name=self.config.model_name, progress_bar=False)
+            if self.config.use_gpu:
+                self._tts.to("cuda")
         return self._tts
 
     def synthesize_to_file(self, text: str) -> Path:
@@ -463,6 +521,8 @@ class TTSEngine:
             raise ValueError("Text is empty.")
         if len(cleaned) > self.config.max_chars:
             raise ValueError(f"Text too long ({len(cleaned)} chars). Max {self.config.max_chars}.")
+        if self.config.backend == "xtts" and not re.search(r"[\u3040-\u30ff]", cleaned):
+            raise ValueError("XTTS accepts only reviewed Japanese text containing kana.")
 
         cache_key = self._cache_key(cleaned)
         wav_path = self.config.cache_dir / f"{cache_key}.wav"
@@ -506,17 +566,30 @@ class TTSEngine:
                     staging_path = self._temporary_wav_path(wav_path, "raw")
                     tts = self._load_model()
                     if self.config.backend == "xtts":
-                        speaker_kwargs = {"language": self.config.language}
+                        speaker_kwargs = {}
                         if self.config.xtts_use_cached_voice:
-                            speaker_kwargs["speaker"] = self.config.speaker_name
+                            speaker_kwargs["speaker_name"] = self.config.speaker_name
                         else:
+                            speaker_kwargs["speaker_name"] = None
                             speaker_wav = self._load_xtts_refs()
                             speaker_kwargs["speaker_wav"] = speaker_wav
-                        tts.tts_to_file(
+                        wav = tts.synthesizer.tts(
                             text=cleaned,
-                            file_path=str(staging_path),
+                            language_name=self.config.language,
+                            # Split complete sentences into independent inference
+                            # calls so one early EOS cannot discard later text.
+                            # The model-level splitter additionally protects a
+                            # single long Japanese sentence (71-char limit).
+                            split_sentences=True,
+                            enable_text_splitting=True,
+                            temperature=self.config.xtts_temperature,
+                            top_k=self.config.xtts_top_k,
+                            top_p=self.config.xtts_top_p,
+                            repetition_penalty=self.config.xtts_repetition_penalty,
+                            speed=self.config.xtts_speed,
                             **speaker_kwargs,
                         )
+                        tts.synthesizer.save_wav(wav=wav, path=str(staging_path))
                     else:
                         tts.tts_to_file(text=cleaned, file_path=str(staging_path))
                     _require_valid_wav_file(staging_path, "TTS output")
@@ -754,4 +827,43 @@ class TTSEngine:
         refs = data.get("refs", [])
         if not refs:
             raise RuntimeError("XTTS refs manifest is empty.")
-        return refs
+        manifest_dir = self.config.xtts_refs_manifest.resolve().parent
+        forbidden_roots = (
+            self.config.cache_dir.resolve(strict=False),
+            DEFAULT_CACHE_DIR.resolve(strict=False),
+            (PROJECT_ROOT / "tts_xtts" / "work").resolve(strict=False),
+        )
+        validated = []
+        total_seconds = 0.0
+        for raw_path in refs:
+            ref_path = Path(raw_path)
+            if not ref_path.is_absolute():
+                ref_path = manifest_dir / ref_path
+            ref_path = ref_path.resolve(strict=False)
+            if any(ref_path == root or root in ref_path.parents for root in forbidden_roots):
+                raise RuntimeError(f"XTTS reference cannot use cache/test output: {ref_path}")
+            if not ref_path.is_file():
+                raise RuntimeError(f"XTTS reference audio not found: {ref_path}")
+            try:
+                with wave.open(str(ref_path), "rb") as reader:
+                    if reader.getcomptype() != "NONE" or reader.getsampwidth() != 2:
+                        raise RuntimeError(
+                            f"XTTS reference must be lossless PCM 16-bit WAV: {ref_path}"
+                        )
+                    if reader.getnchannels() != 1 or reader.getframerate() != 22_050:
+                        raise RuntimeError(
+                            "XTTS reference must be mono 22050 Hz to avoid repeated "
+                            f"resampling: {ref_path}"
+                        )
+                    duration = reader.getnframes() / reader.getframerate()
+            except (EOFError, OSError, wave.Error) as exc:
+                raise RuntimeError(f"XTTS reference is not a valid WAV: {ref_path}") from exc
+            if not 3.0 <= duration <= 15.0:
+                raise RuntimeError(
+                    f"XTTS reference duration must be 3-15 seconds: {ref_path}"
+                )
+            total_seconds += duration
+            validated.append(str(ref_path))
+        if total_seconds > 20.0:
+            raise RuntimeError("XTTS references must total no more than 20 seconds.")
+        return validated

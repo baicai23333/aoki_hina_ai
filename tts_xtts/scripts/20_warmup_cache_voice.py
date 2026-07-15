@@ -74,45 +74,17 @@ def main():
 
     tts = TTS(model_name=XTTS_MODEL, progress_bar=False, gpu=False)
 
-    # Precompute and cache the voice using refs so speaker_name becomes usable.
-    gpt_cond_latent, speaker_embedding = tts.synthesizer.tts_model.get_conditioning_latents(
-        refs,
-        max_ref_length=tts.synthesizer.tts_config.max_ref_len,
-        gpt_cond_len=tts.synthesizer.tts_config.gpt_cond_len,
-        gpt_cond_chunk_len=tts.synthesizer.tts_config.gpt_cond_chunk_len,
-        sound_norm_refs=tts.synthesizer.tts_config.sound_norm_refs,
-    )
-    tts.synthesizer.tts_model.speaker_manager.speakers[SPEAKER_NAME] = {
-        "gpt_cond_latent": gpt_cond_latent,
-        "speaker_embedding": speaker_embedding,
-    }
-
     warmup_path = WORK_DIR / "warmup.wav"
     tts.tts_to_file(
-        text="Warm up voice cache.",
+        text="こんばんは。音声の準備ができました。",
         file_path=str(warmup_path),
-        speaker=SPEAKER_NAME,
         speaker_wav=refs,
         language=LANGUAGE,
     )
     report_lines.append(f"Warmup wav: {warmup_path}")
-
-    cached_voice_ok = False
-    cached_path = WORK_DIR / "cached_voice_test.wav"
-    try:
-        tts.tts_to_file(
-            text="Cache voice test.",
-            file_path=str(cached_path),
-            speaker=SPEAKER_NAME,
-            language=LANGUAGE,
-        )
-        cached_voice_ok = True
-        report_lines.append("Cached voice inference: supported")
-    except Exception as exc:
-        report_lines.append(f"Cached voice inference: failed ({exc})")
-
-    update_env_flag("1" if cached_voice_ok else "0")
-    report_lines.append(f"AOKI_XTTS_USE_CACHED_VOICE={1 if cached_voice_ok else 0}")
+    report_lines.append("Cached voice inference: disabled (the in-memory voice is not persistent)")
+    update_env_flag("0")
+    report_lines.append("AOKI_XTTS_USE_CACHED_VOICE=0")
 
     report_path = REPORT_DIR / "xtts_warmup_report.txt"
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
