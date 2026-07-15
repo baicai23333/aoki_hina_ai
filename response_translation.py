@@ -89,9 +89,15 @@ _KANA_PATTERN = re.compile(r"[\u3040-\u30ff\uff66-\uff9f]")
 _AOKI_HINA_PATTERN = re.compile(r"青木[阳陽]菜|aoki\s*hina", re.IGNORECASE)
 _HINA_BOT_PATTERN = re.compile(r"hina\s*bot", re.IGNORECASE)
 _DIGIT_PATTERN = re.compile(r"\d+")
+# Keep this deterministic guard to high-confidence phrases. Bare 不/没/未/别
+# and A-not-A questions such as 有没有 or 要不要 can be translated faithfully
+# without an explicit Japanese negative form; semantic fidelity is still reviewed.
 _SOURCE_NEGATION_PATTERN = re.compile(
-    r"(?:不是|并非|不能|不会|无法|不要|不得|不应|不可以|没有|没法|"
-    r"未知|未公开|不足|拒绝|禁止|避免|无权|无从|无关|毫无|非官方|不|没|未|别|"
+    r"(?:(?<!是)不是|并非|(?<!能)不能|(?<!会)不会|无法|(?<!要)不要|不得|"
+    r"(?<!应)(?<!该)不应|(?<!可)不可以|(?<!有)没有|没法|"
+    r"未知|未公开|不足|拒绝|禁止|避免|无权|无从|无关|毫无|非官方|"
+    r"别(?:冒充|声称|公开|泄露|透露|分享|提供|编造|猜|推测)|"
+    r"不(?:代表|冒充|声称|公开|泄露|透露|分享|提供|编造|猜测|推测)|"
     r"\bnot\b|\bno\b|\bnever\b|cannot|can't|won't|don't|doesn't|isn't|aren't|"
     r"ない|なく|ません|できず|できない|ではなく|じゃない|せず|ぬ)",
     re.IGNORECASE,
@@ -102,7 +108,7 @@ _JAPANESE_NEGATION_PATTERN = re.compile(
     r"不可|未公開|非公式|無関係|禁止|拒否|控え|避け|不足|困難|かねます)",
 )
 _SOURCE_IDENTITY_NEGATION_PATTERN = re.compile(
-    r"(?:不是|并非|不代表|并不代表|不能代表).{0,16}"
+    r"(?:(?<!是)不是|并非|不代表|并不代表|(?<!能)不能代表).{0,16}"
     r"(?:青木[阳陽]菜(?:本人)?|本人)"
     r"|(?:青木[阳陽]菜(?:さん)?(?:本人)?|本人).{0,12}"
     r"(?:ではない|ではありません|じゃない|じゃありません|ではなく|とは別人)"

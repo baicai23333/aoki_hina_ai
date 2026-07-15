@@ -368,6 +368,74 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         self.assertEqual(len(translator.calls), 2)
         self.assertEqual(len(reviewer.calls), 1)
 
+    def test_lexicalized_and_choice_question_forms_are_not_false_negations(self):
+        cases = (
+            (
+                "你今天有没有遇到什么让你觉得还不错的事呀？",
+                "今日は何かちょっといいことがありましたか？",
+            ),
+            (
+                "要不要先换个模式放松一下？",
+                "先にモードを変えて、少しリラックスしてみますか？",
+            ),
+            (
+                "这个想法不错，不妨先休息一下。",
+                "このアイデアはいいですね。まず少し休んでみるのもよさそうです。",
+            ),
+            (
+                "聊聊未来的计划吧。",
+                "これからの予定について話しましょう。",
+            ),
+            (
+                "这个方案是不是更简单？",
+                "この案のほうが簡単ですか？",
+            ),
+            (
+                "今天能不能休息一下？",
+                "今日は少し休めますか？",
+            ),
+            (
+                "这样会不会更自然？",
+                "このほうが自然になりますか？",
+            ),
+            (
+                "现在可不可以开始？",
+                "今から始めてもいいですか？",
+            ),
+            (
+                "该不应该先喝点水？",
+                "まず水を飲んだほうがいいですか？",
+            ),
+        )
+        for source, candidate in cases:
+            with self.subTest(source=source):
+                translator = FakeLLM([candidate])
+                reviewer = FakeLLM([json.dumps({"ok": True, "issues": []})])
+                service = ResponseTranslationService(translator, reviewer)
+
+                result = service.translate(source, "daily_chat", "none")
+
+                self.assertEqual(result.status, "validated")
+                self.assertEqual(result.text, candidate)
+                self.assertEqual(result.issue_codes, ())
+                self.assertEqual(len(translator.calls), 1)
+                self.assertEqual(len(reviewer.calls), 1)
+
+    def test_choice_question_exception_does_not_hide_a_real_negation(self):
+        source = "未来要不要聊都不错，但不要公开电话号码。"
+        candidate = "今後話すかどうかはどちらでもよく、電話番号を公開してください。"
+        translator = FakeLLM([candidate, candidate])
+        reviewer = FakeLLM()
+        service = ResponseTranslationService(translator, reviewer)
+
+        result = service.translate(source, "daily_chat", "none")
+
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(result.text, "")
+        self.assertIn("source_negation_lost", result.issue_codes)
+        self.assertEqual(len(translator.calls), 2)
+        self.assertEqual(reviewer.calls, [])
+
     def test_negative_phone_number_advice_is_not_treated_as_disclosure(self):
         candidate = "電話番号を共有しないでください。"
         translator = FakeLLM([candidate])
