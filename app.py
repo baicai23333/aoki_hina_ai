@@ -26,10 +26,7 @@ admin_page = st.Page(
 )
 
 navigation = st.navigation(
-    {
-        "Hina Bot": [chat_page],
-        "站点管理": [admin_page],
-    },
-    expanded=True,
+    [chat_page, admin_page],
+    position="hidden",
 )
 navigation.run()
