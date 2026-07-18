@@ -20,6 +20,7 @@ tts_xtts/refs_clean/
 
 # Local GPT-SoVITS runtime, models, downloads, and generated audio
 GPT-SoVITS-package/
+/tts_gpt_sovits/
 GPT-SoVITS*.zip
 GPT-SoVITS*.7z*
 gpt-sovits-*-parts/

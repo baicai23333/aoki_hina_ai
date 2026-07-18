@@ -4,6 +4,7 @@ import io
 import ipaddress
 import os
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -197,6 +198,7 @@ class TTSConfig:
     gpt_sovits_config: Path
     gpt_sovits_normalize_loudness: bool
     gpt_sovits_target_lufs: float
+    gpt_sovits_ffmpeg: Optional[Path]
     cache_max_files: int = DEFAULT_CACHE_MAX_FILES
     cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
     use_gpu: bool = False
@@ -309,6 +311,7 @@ class TTSEngine:
             gpt_sovits_normalize_loudness = (
                 load_env_var("GPT_SOVITS_NORMALIZE_LOUDNESS", "1") or "1"
             ).strip().lower() in {"1", "true", "yes", "on"}
+            gpt_sovits_ffmpeg_value = load_env_var("GPT_SOVITS_FFMPEG")
 
             config = TTSConfig(
                 backend=backend,
@@ -338,6 +341,11 @@ class TTSEngine:
                 )),
                 gpt_sovits_normalize_loudness=gpt_sovits_normalize_loudness,
                 gpt_sovits_target_lufs=float(load_env_var("GPT_SOVITS_TARGET_LUFS", "-16")),
+                gpt_sovits_ffmpeg=(
+                    Path(gpt_sovits_ffmpeg_value)
+                    if gpt_sovits_ffmpeg_value
+                    else None
+                ),
                 cache_max_files=_positive_int_env(
                     "AOKI_TTS_CACHE_MAX_FILES", DEFAULT_CACHE_MAX_FILES
                 ),
@@ -491,6 +499,7 @@ class TTSEngine:
             _file_fingerprint(self.config.gpt_sovits_config),
             str(self.config.gpt_sovits_normalize_loudness),
             str(self.config.gpt_sovits_target_lufs),
+            str(self.config.gpt_sovits_ffmpeg or ""),
             cleaned_text,
         )
         return hashlib.sha256("\0".join(components).encode("utf-8")).hexdigest()
@@ -709,9 +718,7 @@ class TTSEngine:
         )
         try:
             _best_effort_unlink(normalized_path)
-            ffmpeg_path = self.config.gpt_sovits_root / "runtime" / "ffmpeg.exe"
-            if not ffmpeg_path.exists():
-                raise RuntimeError(f"FFmpeg not found: {ffmpeg_path}")
+            ffmpeg_path = self._resolve_ffmpeg_path()
 
             loudnorm = f"loudnorm=I={self.config.gpt_sovits_target_lufs}:TP=-1.5:LRA=11"
             subprocess.run(
@@ -740,6 +747,33 @@ class TTSEngine:
             raise RuntimeError(f"Audio loudness normalization failed: {detail}") from exc
         finally:
             _best_effort_unlink(normalized_path)
+
+    @staticmethod
+    def _running_on_windows() -> bool:
+        return os.name == "nt"
+
+    def _resolve_ffmpeg_path(self) -> Path:
+        configured_path = self.config.gpt_sovits_ffmpeg
+        if configured_path is not None:
+            configured_path = configured_path.expanduser()
+            if configured_path.is_file():
+                return configured_path
+            raise RuntimeError(
+                f"FFmpeg configured by GPT_SOVITS_FFMPEG was not found: {configured_path}"
+            )
+
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            return Path(system_ffmpeg)
+
+        if self._running_on_windows():
+            bundled_ffmpeg = self.config.gpt_sovits_root / "runtime" / "ffmpeg.exe"
+            if bundled_ffmpeg.is_file():
+                return bundled_ffmpeg
+
+        raise RuntimeError(
+            "FFmpeg not found. Set GPT_SOVITS_FFMPEG or install ffmpeg on PATH."
+        )
 
     def _ensure_gpt_sovits_api(self) -> None:
         scheme, host, port = self._gpt_sovits_api_endpoint()

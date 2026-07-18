@@ -58,6 +58,7 @@ class TTSEngineHardeningTests(unittest.TestCase):
         cache_max_bytes=tts_engine.DEFAULT_CACHE_MAX_BYTES,
         api_url="http://127.0.0.1:9880/tts",
         auto_start=False,
+        ffmpeg_path=None,
     ) -> TTSConfig:
         return TTSConfig(
             backend="gpt_sovits",
@@ -81,6 +82,7 @@ class TTSEngineHardeningTests(unittest.TestCase):
             gpt_sovits_config=self.test_root / "config.yaml",
             gpt_sovits_normalize_loudness=normalize,
             gpt_sovits_target_lufs=-16.0,
+            gpt_sovits_ffmpeg=ffmpeg_path,
             cache_max_files=cache_max_files,
             cache_max_bytes=cache_max_bytes,
         )
@@ -230,11 +232,45 @@ class TTSEngineHardeningTests(unittest.TestCase):
 
                 self.assertEqual(list(self.cache_dir.glob("*.wav")), [])
 
+    def test_gpt_sovits_request_uses_v2proplus_zero_shot_settings(self):
+        engine = TTSEngine(self.make_config())
+        response = Mock()
+        response.headers = {"Content-Type": "audio/wav"}
+        response.content = valid_wav_bytes()
+        response.raise_for_status.return_value = None
+
+        with patch.object(engine, "_ensure_gpt_sovits_api"), patch.object(
+            requests, "post", return_value=response
+        ) as post_mock:
+            engine.synthesize_to_file("短い日本語です。")
+
+        self.assertEqual(
+            post_mock.call_args.kwargs["json"],
+            {
+                "text": "短い日本語です。",
+                "text_lang": "ja",
+                "ref_audio_path": str(self.reference_audio.resolve()),
+                "prompt_text": "reference text",
+                "prompt_lang": "ja",
+                "text_split_method": "cut5",
+                "batch_size": 1,
+                "speed_factor": 1.0,
+                "seed": 12345,
+                "media_type": "wav",
+                "streaming_mode": False,
+                "parallel_infer": True,
+                "repetition_penalty": 1.35,
+            },
+        )
+        self.assertEqual(post_mock.call_args.kwargs["timeout"], (10, 10))
+
     def test_normalization_failure_cleans_all_intermediate_audio(self):
-        engine = TTSEngine(self.make_config(normalize=True))
-        ffmpeg_path = engine.config.gpt_sovits_root / "runtime" / "ffmpeg.exe"
+        ffmpeg_path = self.test_root / "bin" / "ffmpeg"
         ffmpeg_path.parent.mkdir(parents=True)
         ffmpeg_path.write_bytes(b"test stub")
+        engine = TTSEngine(
+            self.make_config(normalize=True, ffmpeg_path=ffmpeg_path)
+        )
         response = Mock()
         response.headers = {"Content-Type": "audio/wav; charset=binary"}
         response.content = valid_wav_bytes()
@@ -251,6 +287,66 @@ class TTSEngineHardeningTests(unittest.TestCase):
                 engine.synthesize_to_file("こんにちは")
 
         self.assertEqual(list(self.cache_dir.glob("*.wav")), [])
+
+    def test_normalization_prefers_configured_ffmpeg_and_preserves_audio_settings(self):
+        ffmpeg_path = self.test_root / "custom" / "ffmpeg"
+        ffmpeg_path.parent.mkdir(parents=True)
+        ffmpeg_path.write_bytes(b"test stub")
+        engine = TTSEngine(
+            self.make_config(normalize=True, ffmpeg_path=ffmpeg_path)
+        )
+        source_path = self.test_root / "source.wav"
+        output_path = self.test_root / "output.wav"
+        source_path.write_bytes(valid_wav_bytes())
+
+        def write_normalized_output(command, **kwargs):
+            Path(command[-1]).write_bytes(valid_wav_bytes())
+
+        with patch.object(tts_engine.shutil, "which") as which_mock, patch.object(
+            subprocess, "run", side_effect=write_normalized_output
+        ) as run_mock:
+            engine._normalize_loudness(source_path, output_path)
+
+        which_mock.assert_not_called()
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[0], str(ffmpeg_path))
+        self.assertEqual(command[command.index("-af") + 1], "loudnorm=I=-16.0:TP=-1.5:LRA=11")
+        self.assertEqual(command[command.index("-ar") + 1], "32000")
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertTrue(output_path.exists())
+
+    def test_normalization_uses_ffmpeg_from_path_when_not_configured(self):
+        engine = TTSEngine(self.make_config(normalize=True))
+        source_path = self.test_root / "source.wav"
+        output_path = self.test_root / "output.wav"
+        source_path.write_bytes(valid_wav_bytes())
+
+        def write_normalized_output(command, **kwargs):
+            Path(command[-1]).write_bytes(valid_wav_bytes())
+
+        with patch.object(
+            tts_engine.shutil, "which", return_value="/usr/local/bin/ffmpeg"
+        ), patch.object(subprocess, "run", side_effect=write_normalized_output) as run_mock:
+            engine._normalize_loudness(source_path, output_path)
+
+        self.assertEqual(run_mock.call_args.args[0][0], "/usr/local/bin/ffmpeg")
+
+    def test_bundled_ffmpeg_fallback_is_windows_only(self):
+        engine = TTSEngine(self.make_config(normalize=True))
+        bundled_ffmpeg = engine.config.gpt_sovits_root / "runtime" / "ffmpeg.exe"
+        bundled_ffmpeg.parent.mkdir(parents=True)
+        bundled_ffmpeg.write_bytes(b"test stub")
+
+        with patch.object(tts_engine.shutil, "which", return_value=None), patch.object(
+            engine, "_running_on_windows", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "FFmpeg not found"):
+                engine._resolve_ffmpeg_path()
+
+        with patch.object(tts_engine.shutil, "which", return_value=None), patch.object(
+            engine, "_running_on_windows", return_value=True
+        ):
+            self.assertEqual(engine._resolve_ffmpeg_path(), bundled_ffmpeg)
 
     def test_wave_validation_rejects_magic_only_and_truncated_files(self):
         magic_only = b"RIFF" + struct.pack("<I", 36) + b"WAVE" + (b"\x00" * 32)

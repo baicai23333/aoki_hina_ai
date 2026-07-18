@@ -1,0 +1,19 @@
+[Unit]
+Description=GPT-SoVITS TTS API for Aoki Hina
+After=network.target
+
+[Service]
+Type=simple
+User=mutsumi
+Group=mutsumi
+WorkingDirectory=/home/mutsumi/GPT-SoVITS
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=NLTK_DATA=/home/mutsumi/GPT-SoVITS/.venv/nltk_data
+Environment=PYTHONUTF8=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/mutsumi/GPT-SoVITS/.venv/bin/python /home/mutsumi/GPT-SoVITS/api_v2.py -a 127.0.0.1 -p 9880 -c /home/mutsumi/aoki_hina_ai/tts_gpt_sovits/current/gpt_sovits_tts_infer.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -144,7 +144,41 @@ Set `AOKI_DEBUG_UI=1` for an optional local sidebar trace. It exposes only allow
 Set `AOKI_TTS_ENABLED=1` and `AOKI_TTS_BACKEND=gpt_sovits` in `.env`.
 Set `GPT_SOVITS_ROOT` to an installed GPT-SoVITS directory, then configure a local 3–10 second licensed or original reference WAV and its exact transcript using `GPT_SOVITS_REFERENCE_AUDIO` and `GPT_SOVITS_REFERENCE_TEXT`. Do not use a real person's recording without permission or present synthesized speech as that person.
 
-With `GPT_SOVITS_AUTO_START=1`, the chat app starts the configured local API when speech is first requested; non-local endpoints are never auto-started. The response must have an accepted WAV media type and a complete, decodable PCM WAV structure; invalid or partial output is deleted. Cache keys include the relevant voice/configuration inputs, same-text synthesis is locked, and the oldest cached files are pruned according to `AOKI_TTS_CACHE_MAX_FILES` and `AOKI_TTS_CACHE_MAX_BYTES`. Model packages, reference recordings, generated speech, `.env`, logs, and chat databases are intentionally excluded from Git.
+On Linux production hosts, run the API as an independent service and keep
+`GPT_SOVITS_AUTO_START=0` so a Streamlit worker never owns the model process:
+
+```bash
+sudo install -m 0644 deploy/gpt-sovits.service /etc/systemd/system/gpt-sovits.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now gpt-sovits.service
+```
+
+Mixed Japanese and Latin text uses GPT-SoVITS's English G2P path. Install its
+runtime dictionaries inside the dedicated environment before starting the
+service:
+
+```bash
+/home/mutsumi/GPT-SoVITS/.venv/bin/python -m nltk.downloader \
+  -d /home/mutsumi/GPT-SoVITS/.venv/nltk_data \
+  averaged_perceptron_tagger averaged_perceptron_tagger_eng cmudict
+```
+
+The template binds the API to `127.0.0.1:9880`, uses a dedicated
+`/home/mutsumi/GPT-SoVITS/.venv`, points `NLTK_DATA` at that environment, and
+does not couple API failure to the web service. Adjust its absolute paths when
+deploying under another account. Set
+`GPT_SOVITS_FFMPEG` to an explicit executable path when possible; otherwise the
+app searches `PATH`, with the bundled `runtime/ffmpeg.exe` used only on Windows.
+The response must have an accepted WAV media type and a complete, decodable PCM
+WAV structure; invalid or partial output is deleted. Cache keys include the
+relevant voice/configuration inputs, same-text synthesis is locked, and the
+oldest cached files are pruned according to `AOKI_TTS_CACHE_MAX_FILES` and
+`AOKI_TTS_CACHE_MAX_BYTES`. Model packages, reference recordings, generated
+speech, `.env`, logs, and chat databases are intentionally excluded from Git.
+
+For a local Windows setup without a service manager, `GPT_SOVITS_AUTO_START=1`
+allows the chat app to start a configured loopback API. Non-local endpoints are
+never auto-started.
 
 ## Legacy XTTS Setup
 
