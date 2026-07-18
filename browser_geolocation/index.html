@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        color: var(--text-color, inherit);
+        background: transparent;
+      }
+      button {
+        width: 100%;
+        min-height: 38px;
+        border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+        border-radius: 8px;
+        padding: 0.45rem 0.75rem;
+        color: inherit;
+        background: transparent;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 600;
+      }
+      button:hover { border-color: var(--primary-color, #ff4b4b); }
+      button:disabled { cursor: wait; opacity: 0.65; }
+      #status {
+        min-height: 1.1rem;
+        margin-top: 0.35rem;
+        font-size: 0.78rem;
+        opacity: 0.78;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="locate" type="button">允许获取大致位置</button>
+    <div id="status">仅在点击后请求浏览器权限；只返回约 1 公里精度坐标。</div>
+    <script>
+      function sendMessageToStreamlitClient(type, data) {
+        const payload = Object.assign(
+          { isStreamlitMessage: true, type: type },
+          data || {}
+        );
+        window.parent.postMessage(payload, "*");
+      }
+
+      function setFrameHeight() {
+        sendMessageToStreamlitClient("streamlit:setFrameHeight", {
+          height: document.documentElement.scrollHeight + 2,
+        });
+      }
+
+      function sendValue(value) {
+        sendMessageToStreamlitClient("streamlit:setComponentValue", {
+          value: value,
+          dataType: "json",
+        });
+      }
+
+      function errorCode(error) {
+        if (!window.isSecureContext) return "insecure_context";
+        if (!error) return "unknown";
+        if (error.code === 1) return "permission_denied";
+        if (error.code === 2) return "position_unavailable";
+        if (error.code === 3) return "timeout";
+        return "unknown";
+      }
+
+      const button = document.getElementById("locate");
+      const status = document.getElementById("status");
+
+      button.addEventListener("click", function () {
+        if (!window.isSecureContext) {
+          status.textContent = "浏览器只允许在 HTTPS 或本机地址使用定位。";
+          sendValue({ status: "error", code: "insecure_context" });
+          return;
+        }
+        if (!navigator.geolocation) {
+          status.textContent = "当前浏览器不支持定位，请手动填写城市。";
+          sendValue({ status: "error", code: "unsupported" });
+          return;
+        }
+
+        button.disabled = true;
+        status.textContent = "正在等待浏览器授权…";
+        navigator.geolocation.getCurrentPosition(
+          function (position) {
+            const latitude = Math.round(position.coords.latitude * 100) / 100;
+            const longitude = Math.round(position.coords.longitude * 100) / 100;
+            status.textContent = "已取得大致位置，保存后可用于天气查询。";
+            sendValue({
+              status: "success",
+              latitude: latitude,
+              longitude: longitude,
+              accuracy_m: position.coords.accuracy,
+            });
+            button.disabled = false;
+          },
+          function (error) {
+            const code = errorCode(error);
+            status.textContent = code === "permission_denied"
+              ? "你没有授予定位权限；仍可手动填写城市。"
+              : "暂时无法取得位置，请手动填写城市或稍后再试。";
+            sendValue({ status: "error", code: code });
+            button.disabled = false;
+          },
+          {
+            enableHighAccuracy: false,
+            timeout: 10000,
+            maximumAge: 1800000,
+          }
+        );
+      });
+
+      window.addEventListener("message", function (event) {
+        if (event.data && event.data.type === "streamlit:render") {
+          const theme = event.data.theme || {};
+          if (theme.textColor) {
+            document.documentElement.style.setProperty("--text-color", theme.textColor);
+          }
+          if (theme.primaryColor) {
+            document.documentElement.style.setProperty("--primary-color", theme.primaryColor);
+          }
+          setFrameHeight();
+        }
+      });
+
+      sendMessageToStreamlitClient("streamlit:componentReady", { apiVersion: 1 });
+      window.addEventListener("load", setFrameHeight);
+    </script>
+  </body>
+</html>

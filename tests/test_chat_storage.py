@@ -11,6 +11,7 @@ from chat_storage import (
     init_chat_storage_schema,
     list_messages,
     save_exchange,
+    update_failed_message_translation,
     update_message_audio,
 )
 
@@ -165,6 +166,205 @@ class ChatStorageTests(unittest.TestCase):
         self.assertEqual(alice[alice_ai_id].audio_path, "alice.wav")
         self.assertIsNone(alice[alice_user_id].audio_path)
         self.assertIsNone(bob[bob_ai_id].audio_path)
+
+    def test_failed_translation_retry_atomically_stores_validated_result(self):
+        _, ai_id = save_exchange(
+            self.db_path,
+            "alice",
+            "几点了？",
+            "现在是下午四点。",
+            None,
+            "failed",
+            "translator_exception",
+            None,
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE chat_history SET audio_path = ? WHERE id = ?",
+                ("stale.wav", ai_id),
+            )
+            conn.commit()
+
+        updated = update_failed_message_translation(
+            self.db_path,
+            "alice",
+            ai_id,
+            "现在是下午四点。",
+            "translator_exception",
+            "今は午後四時です。",
+            "validated",
+            None,
+        )
+
+        self.assertTrue(updated)
+        message = {item.id: item for item in list_messages(self.db_path, "alice")}[ai_id]
+        self.assertEqual(message.japanese_content, "今は午後四時です。")
+        self.assertEqual(message.translation_status, "validated")
+        self.assertIsNone(message.translation_issue_code)
+        self.assertIsNone(message.audio_path)
+        self.assertFalse(
+            update_failed_message_translation(
+                self.db_path,
+                "alice",
+                ai_id,
+                "现在是下午四点。",
+                "translator_exception",
+                "別の訳です。",
+                "validated",
+                None,
+            )
+        )
+
+    def test_failed_translation_retry_is_user_scoped_and_compare_and_swap_safe(self):
+        alice_user_id, alice_ai_id = save_exchange(
+            self.db_path,
+            "alice",
+            "问题",
+            "回答",
+            None,
+            "failed",
+            "reviewer_exception",
+            None,
+        )
+        _, bob_ai_id = save_exchange(
+            self.db_path,
+            "bob",
+            "问题",
+            "回答",
+            None,
+            "failed",
+            "translator_exception",
+            None,
+        )
+
+        rejected_updates = (
+            ("bob", alice_ai_id, "回答", "reviewer_exception"),
+            ("alice", bob_ai_id, "回答", "translator_exception"),
+            ("alice", alice_user_id, "问题", "reviewer_exception"),
+            ("alice", alice_ai_id, "已变化的回答", "reviewer_exception"),
+            ("alice", alice_ai_id, "回答", "translator_exception"),
+        )
+        for username, message_id, content, expected_issue in rejected_updates:
+            with self.subTest(username=username, message_id=message_id):
+                self.assertFalse(
+                    update_failed_message_translation(
+                        self.db_path,
+                        username,
+                        message_id,
+                        content,
+                        expected_issue,
+                        "再生成した翻訳です。",
+                        "validated",
+                        None,
+                    )
+                )
+
+        alice = {item.id: item for item in list_messages(self.db_path, "alice")}
+        bob = {item.id: item for item in list_messages(self.db_path, "bob")}
+        self.assertEqual(alice[alice_ai_id].translation_status, "failed")
+        self.assertEqual(bob[bob_ai_id].translation_status, "failed")
+
+    def test_failed_or_rejected_retry_result_discards_translation_and_audio(self):
+        _, ai_id = save_exchange(
+            self.db_path,
+            "alice",
+            "问题",
+            "回答",
+            None,
+            "failed",
+            "translator_exception",
+            None,
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE chat_history SET japanese_content = ?, audio_path = ? WHERE id = ?",
+                ("stale translation", "stale.wav", ai_id),
+            )
+            conn.commit()
+
+        self.assertTrue(
+            update_failed_message_translation(
+                self.db_path,
+                "alice",
+                ai_id,
+                "回答",
+                "translator_exception",
+                "must be discarded",
+                "failed",
+                "reviewer_exception",
+            )
+        )
+        after_failure = {
+            item.id: item for item in list_messages(self.db_path, "alice")
+        }[ai_id]
+        self.assertIsNone(after_failure.japanese_content)
+        self.assertIsNone(after_failure.audio_path)
+        self.assertEqual(after_failure.translation_issue_code, "reviewer_exception")
+
+        self.assertTrue(
+            update_failed_message_translation(
+                self.db_path,
+                "alice",
+                ai_id,
+                "回答",
+                "reviewer_exception",
+                "must also be discarded",
+                "rejected",
+                "reviewer_rejected",
+            )
+        )
+        after_rejection = {
+            item.id: item for item in list_messages(self.db_path, "alice")
+        }[ai_id]
+        self.assertIsNone(after_rejection.japanese_content)
+        self.assertIsNone(after_rejection.audio_path)
+        self.assertEqual(after_rejection.translation_status, "rejected")
+
+    def test_failed_translation_retry_rejects_unsafe_contracts(self):
+        _, ai_id = save_exchange(
+            self.db_path,
+            "alice",
+            "问题",
+            "回答",
+            None,
+            "failed",
+            "fixed_source_mismatch",
+            None,
+        )
+
+        with self.assertRaisesRegex(ChatStorageValidationError, "not eligible"):
+            update_failed_message_translation(
+                self.db_path,
+                "alice",
+                ai_id,
+                "回答",
+                "fixed_source_mismatch",
+                "訳文",
+                "validated",
+                None,
+            )
+        with self.assertRaisesRegex(ChatStorageValidationError, "require japanese"):
+            update_failed_message_translation(
+                self.db_path,
+                "alice",
+                ai_id,
+                "回答",
+                "translator_exception",
+                None,
+                "validated",
+                None,
+            )
+        with self.assertRaisesRegex(ChatStorageValidationError, "validated, rejected"):
+            update_failed_message_translation(
+                self.db_path,
+                "alice",
+                ai_id,
+                "回答",
+                "translator_exception",
+                "固定訳",
+                "fixed",
+                None,
+            )
 
     def test_exchange_rolls_back_user_row_when_ai_insert_fails(self):
         self.init_schema()

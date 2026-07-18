@@ -11,20 +11,50 @@ from account_auth import (
     init_account_auth_schema,
     verify_account,
 )
+from artifact_presentation import render_message_artifacts
 from chat_history_context import build_model_history
+from chat_realtime import (
+    build_realtime_unavailable_bundle,
+    build_recent_updates_lookup,
+    build_weather_lookup,
+    realtime_grounding_is_unavailable,
+)
 from chat_storage import (
     PLAYABLE_TRANSLATION_STATUSES,
     init_chat_storage_schema,
     list_messages,
     save_exchange,
+    update_failed_message_translation,
     update_message_audio as update_stored_message_audio,
 )
-from chat_presentation import translation_status_message
+from collector_worker import seed_information_sources_from_registry
+from chat_presentation import (
+    manual_translation_retry_available,
+    translation_status_message,
+)
+from grounding import GroundingBundle
+from information_store import init_information_schema
+from message_artifacts import (
+    init_message_artifacts_schema,
+    list_artifacts_for_messages,
+    save_ui_artifacts,
+)
 from pipeline_debug import build_debug_trace
 from persona_pipeline import PersonaPipeline
 from response_text_policy import has_hidden_or_redacted_content
 from response_translation import ResponseTranslationService, TranslationResult
+from runtime_profile import init_runtime_profile_schema
+from runtime_ui import render_runtime_sidebar
+from search_service import SearchService
 from tts_engine import TTSEngine, load_env_var, safe_cached_wav_path
+from tool_orchestrator import ToolOrchestrator, ToolRoute
+from translation_audit import (
+    DEFAULT_TRANSLATION_AUDIT_SINK,
+    new_translation_operation_id,
+    record_provider_exception,
+    record_stored_outcome,
+    record_terminal_failure,
+)
 from user_memory import (
     MEMORY_CATEGORIES,
     UserMemoryLimitError,
@@ -35,6 +65,7 @@ from user_memory import (
     list_memories,
     upsert_memory,
 )
+from weather_service import WeatherService
 # ================== DeepSeek API Key ==================
 API_KEY = load_env_var("DEEPSEEK_API_KEY")
 if not API_KEY:
@@ -43,6 +74,7 @@ if not API_KEY:
 
 API_BASE_URL = load_env_var("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 MODEL_NAME = load_env_var("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEFAULT_TIMEZONE = load_env_var("AOKI_DEFAULT_TIMEZONE", "Asia/Shanghai")
 
 # Windows DNS on this machine occasionally returns WSAHOST_NOT_FOUND (11001)
 # for api.deepseek.com. Keep normal DNS as the first choice and only fall back
@@ -73,14 +105,14 @@ def getaddrinfo_with_deepseek_fallback(host, port, family=0, type=0, proto=0, fl
 
 socket.getaddrinfo = getaddrinfo_with_deepseek_fallback
 
-def create_llm(temperature, max_tokens):
+def create_llm(temperature, max_tokens, *, max_retries=6):
     return ChatDeepSeek(
         model=MODEL_NAME,
         api_key=API_KEY,
         base_url=API_BASE_URL,
         temperature=temperature,
         max_tokens=max_tokens,
-        max_retries=6,
+        max_retries=max_retries,
         timeout=90,
         extra_body={"thinking": {"type": "disabled"}},
     )
@@ -89,7 +121,16 @@ def create_llm(temperature, max_tokens):
 planner_llm = create_llm(temperature=0.2, max_tokens=700)
 generator_llm = create_llm(temperature=0.8, max_tokens=1024)
 validator_llm = create_llm(temperature=0.0, max_tokens=700)
-translator_llm = create_llm(temperature=0.0, max_tokens=1024)
+# Translation retries are explicitly bounded and audited by
+# ResponseTranslationService. Disable hidden SDK retries for both translation
+# stages so an application attempt maps to one provider request.
+translator_llm = create_llm(temperature=0.0, max_tokens=1024, max_retries=0)
+translation_reviewer_llm = create_llm(
+    temperature=0.0,
+    max_tokens=700,
+    max_retries=0,
+)
+tool_router_llm = create_llm(temperature=0.0, max_tokens=500)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 try:
@@ -103,7 +144,29 @@ persona_pipeline = PersonaPipeline(
     persona_dir=PROJECT_DIR / "persona",
     max_history_messages=PERSONA_HISTORY_MESSAGES,
 )
-translation_service = ResponseTranslationService(translator_llm, validator_llm)
+translation_service = ResponseTranslationService(
+    translator_llm,
+    translation_reviewer_llm,
+)
+try:
+    SEARCH_TIMEOUT_SECONDS = float(
+        load_env_var("AOKI_SEARCH_TIMEOUT_SECONDS", "15") or "15"
+    )
+except (TypeError, ValueError):
+    SEARCH_TIMEOUT_SECONDS = 15.0
+if not 0 < SEARCH_TIMEOUT_SECONDS <= 60:
+    SEARCH_TIMEOUT_SECONDS = 15.0
+SEARCH_SERVICE_INIT_FAILED = False
+try:
+    search_service = SearchService(
+        tavily_api_key=load_env_var("TAVILY_API_KEY"),
+        brave_api_key=load_env_var("BRAVE_SEARCH_API_KEY"),
+        timeout_seconds=SEARCH_TIMEOUT_SECONDS,
+    )
+except Exception:
+    search_service = None
+    SEARCH_SERVICE_INIT_FAILED = True
+weather_service = WeatherService()
 
 # ================== 安装 argon2（如果未安装会提示） ==================
 try:
@@ -118,6 +181,7 @@ DB_FILE = PROJECT_DIR / "chat_history.db"
 MAX_USERNAME_LENGTH = 80
 
 def init_db():
+    optional_issues = []
     conn = sqlite3.connect(DB_FILE)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
@@ -147,10 +211,42 @@ def init_db():
         init_chat_storage_schema(conn)
         init_user_memory_schema(conn)
         conn.commit()
+        for name, initializer in (
+            ("runtime_profile", init_runtime_profile_schema),
+            ("message_artifacts", init_message_artifacts_schema),
+            ("official_information", init_information_schema),
+        ):
+            try:
+                initializer(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                optional_issues.append(name)
     finally:
         conn.close()
+    return tuple(optional_issues)
 
-init_db()
+OPTIONAL_INIT_ISSUES = init_db()
+if SEARCH_SERVICE_INIT_FAILED:
+    OPTIONAL_INIT_ISSUES = (*OPTIONAL_INIT_ISSUES, "search_registry")
+
+
+@st.cache_resource(show_spinner=False)
+def _seed_information_sources_once(db_path: str, registry_path: str):
+    return seed_information_sources_from_registry(db_path, registry_path)
+
+
+try:
+    if "official_information" not in OPTIONAL_INIT_ISSUES:
+        _seed_information_sources_once(
+            str(DB_FILE),
+            str(PROJECT_DIR / "official_sources.json"),
+        )
+except Exception:
+    OPTIONAL_INIT_ISSUES = (*OPTIONAL_INIT_ISSUES, "official_source_seed")
+
+if OPTIONAL_INIT_ISSUES:
+    st.warning("部分即时信息功能暂时无法初始化；普通聊天和已有记录仍可继续使用。")
 
 # ================== TTS 配置 ==================
 def is_tts_enabled():
@@ -160,6 +256,16 @@ def is_tts_enabled():
 
 def is_debug_enabled():
     value = (load_env_var("AOKI_DEBUG_UI", "0") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def is_tool_calling_enabled():
+    value = (load_env_var("AOKI_TOOL_CALLING_ENABLED", "1") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def is_weather_enabled():
+    value = (load_env_var("AOKI_WEATHER_ENABLED", "1") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 # ================== 用户函数（argon2） ==================
@@ -437,16 +543,24 @@ else:
     auto_tts_key = f"auto_tts_{username}"
     pending_autoplay_key = f"pending_autoplay_message_id_{username}"
     tts_flash_key = f"tts_flash_error_{username}"
+    translation_retry_flash_key = f"translation_retry_flash_{username}"
     st.sidebar.write(f"当前用户：**{username}** 🩵")
     if st.sidebar.button("退出登录"):
         st.session_state.pop(pending_autoplay_key, None)
         st.session_state.pop(tts_flash_key, None)
+        st.session_state.pop(translation_retry_flash_key, None)
+        st.session_state.pop(f"runtime_geo_version_{username}", None)
         st.session_state.authenticated = False
         st.session_state.username = None
         st.session_state.auth_version = None
         st.rerun()
 
     render_memory_sidebar(username)
+    runtime_context = render_runtime_sidebar(
+        DB_FILE,
+        username,
+        fallback_timezone=DEFAULT_TIMEZONE or "Asia/Shanghai",
+    )
     render_debug_sidebar(username)
 
     tts_enabled = is_tts_enabled()
@@ -466,6 +580,18 @@ else:
     tts_flash_error = st.session_state.pop(tts_flash_key, None)
     if tts_flash_error:
         st.warning(tts_flash_error)
+    translation_retry_flash = st.session_state.pop(
+        translation_retry_flash_key,
+        None,
+    )
+    if translation_retry_flash == "validated":
+        st.success("日语译文已重新生成并通过复核。需要语音时请点击 Play。")
+    elif translation_retry_flash == "rejected":
+        st.warning("重新生成的日语译文仍未通过安全复核，本条继续仅显示中文。")
+    elif translation_retry_flash == "failed":
+        st.warning("日语翻译仍暂时失败，你可以稍后再次点击“重新翻译”。")
+    elif translation_retry_flash == "stale":
+        st.info("这条消息的翻译状态已在其他页面更新，当前记录已经刷新。")
 
     # SQLite is the canonical history. Rebuild model context from immutable row IDs.
     try:
@@ -473,6 +599,14 @@ else:
     except Exception:
         st.error("暂时无法读取聊天记录，请稍后再试。")
         st.stop()
+    try:
+        artifacts_by_message = list_artifacts_for_messages(
+            DB_FILE,
+            [record.id for record in stored_messages if record.type == "ai"],
+        )
+    except Exception:
+        artifacts_by_message = {}
+        st.warning("聊天记录已读取，但部分天气或来源卡片暂时无法显示。")
     history = StreamlitChatMessageHistory(key=f"chat_{username}")
     history.clear()
     for message in build_model_history(stored_messages):
@@ -522,6 +656,107 @@ else:
                 )
                 if translation_notice:
                     st.warning(translation_notice)
+
+                if manual_translation_retry_available(
+                    record.translation_status,
+                    record.translation_issue_code,
+                    source_has_hidden_content=source_has_hidden_content,
+                ):
+                    retry_key = f"translation_retry_{username}_{record.id}"
+                    if st.button("重新翻译", key=retry_key):
+                        retry_operation_id = new_translation_operation_id()
+                        try:
+                            with st.spinner("正在重新生成并复核日语译文..."):
+                                retry_result = translation_service.translate_ordinary(
+                                    record.content,
+                                    operation_id=retry_operation_id,
+                                )
+                        except Exception as exception:
+                            record_provider_exception(
+                                DEFAULT_TRANSLATION_AUDIT_SINK,
+                                operation_id=retry_operation_id,
+                                stage="orchestration",
+                                application_attempt=0,
+                                retry_scheduled=False,
+                                exception=exception,
+                                issue_code="translator_exception",
+                            )
+                            record_terminal_failure(
+                                DEFAULT_TRANSLATION_AUDIT_SINK,
+                                operation_id=retry_operation_id,
+                                stage="orchestration",
+                                application_attempt=0,
+                                issue_code="translator_exception",
+                            )
+                            retry_result = TranslationResult(
+                                text="",
+                                status="failed",
+                                issue_codes=("translator_exception",),
+                            )
+
+                        retry_japanese = (
+                            retry_result.text
+                            if retry_result.status in PLAYABLE_TRANSLATION_STATUSES
+                            else None
+                        )
+                        retry_issue_code = (
+                            retry_result.issue_codes[0]
+                            if retry_result.issue_codes
+                            else None
+                        )
+                        try:
+                            updated = update_failed_message_translation(
+                                DB_FILE,
+                                username,
+                                record.id,
+                                record.content,
+                                record.translation_issue_code,
+                                retry_japanese,
+                                retry_result.status,
+                                retry_issue_code,
+                            )
+                        except Exception:
+                            record_terminal_failure(
+                                DEFAULT_TRANSLATION_AUDIT_SINK,
+                                operation_id=retry_operation_id,
+                                stage="storage",
+                                application_attempt=0,
+                                issue_code="storage_exception",
+                            )
+                            st.warning("译文已经处理，但更新聊天记录失败，请稍后再试。")
+                        else:
+                            if not updated:
+                                record_terminal_failure(
+                                    DEFAULT_TRANSLATION_AUDIT_SINK,
+                                    operation_id=retry_operation_id,
+                                    stage="storage",
+                                    application_attempt=0,
+                                    issue_code="storage_compare_and_swap_miss",
+                                )
+                                st.session_state[translation_retry_flash_key] = "stale"
+                                st.rerun()
+                            else:
+                                record_stored_outcome(
+                                    DEFAULT_TRANSLATION_AUDIT_SINK,
+                                    operation_id=retry_operation_id,
+                                    translation_status=retry_result.status,
+                                    issue_code=retry_issue_code,
+                                    message_id=record.id,
+                                )
+                                if (
+                                    st.session_state.get(pending_autoplay_key)
+                                    == record.id
+                                ):
+                                    st.session_state.pop(pending_autoplay_key, None)
+                                st.session_state[translation_retry_flash_key] = (
+                                    retry_result.status
+                                )
+                                st.rerun()
+
+                render_message_artifacts(
+                    artifacts_by_message.get(record.id, ()),
+                    st_module=st,
+                )
 
                 verified_audio_path = (
                     safe_cached_wav_path(record.audio_path)
@@ -577,11 +812,66 @@ else:
                     except Exception:
                         current_user_memories = []
                         st.warning("本轮暂时无法读取长期记忆，将按普通对话继续。")
-                    pipeline_result = persona_pipeline.respond(
+                    intent = persona_pipeline.classifier.classify(user_input)
+                    realtime_grounding = GroundingBundle.empty()
+                    realtime_unavailable = False
+                    route_probe = ToolOrchestrator(None).route(
                         user_input,
-                        history.messages,
-                        user_memories=current_user_memories,
+                        safety_label=intent.value,
                     )
+                    if route_probe is not ToolRoute.NONE:
+                        if is_tool_calling_enabled():
+                            orchestrator = ToolOrchestrator(
+                                tool_router_llm,
+                                search_service=search_service,
+                                get_weather=(
+                                    build_weather_lookup(
+                                        weather_service,
+                                        runtime_context,
+                                    )
+                                    if is_weather_enabled()
+                                    else None
+                                ),
+                                query_recent_updates=build_recent_updates_lookup(
+                                    DB_FILE
+                                ),
+                            )
+                            try:
+                                tool_result = orchestrator.orchestrate(
+                                    user_input,
+                                    (),
+                                    safety_label=intent.value,
+                                )
+                                realtime_grounding = tool_result.grounding
+                            except Exception:
+                                realtime_grounding = build_realtime_unavailable_bundle(
+                                    route_probe.value
+                                )
+                        else:
+                            realtime_grounding = build_realtime_unavailable_bundle(
+                                route_probe.value
+                            )
+                        if not realtime_grounding.facts:
+                            realtime_grounding = realtime_grounding.merge(
+                                build_realtime_unavailable_bundle(route_probe.value)
+                            )
+                        realtime_unavailable = realtime_grounding_is_unavailable(
+                            realtime_grounding,
+                            route_probe.value,
+                        )
+                    if realtime_unavailable:
+                        pipeline_result = persona_pipeline.realtime_unavailable_result(
+                            user_input,
+                            route_probe.value,
+                        )
+                    else:
+                        pipeline_result = persona_pipeline.respond(
+                            user_input,
+                            history.messages,
+                            user_memories=current_user_memories,
+                            runtime_context=runtime_context,
+                            grounding=realtime_grounding,
+                        )
                     response_text = pipeline_result.content
                     if has_hidden_or_redacted_content(response_text):
                         st.error(
@@ -609,14 +899,32 @@ else:
             ) * 1000
 
             translation_started = time.perf_counter()
+            translation_operation_id = new_translation_operation_id()
             try:
                 with st.spinner("日本語に翻訳しています..."):
                     translation_result = translation_service.translate(
                         response_text,
                         pipeline_result.intent.value,
                         pipeline_result.plan.get("boundary_action", "none"),
+                        operation_id=translation_operation_id,
                     )
-            except Exception:
+            except Exception as exception:
+                record_provider_exception(
+                    DEFAULT_TRANSLATION_AUDIT_SINK,
+                    operation_id=translation_operation_id,
+                    stage="orchestration",
+                    application_attempt=0,
+                    retry_scheduled=False,
+                    exception=exception,
+                    issue_code="translator_exception",
+                )
+                record_terminal_failure(
+                    DEFAULT_TRANSLATION_AUDIT_SINK,
+                    operation_id=translation_operation_id,
+                    stage="orchestration",
+                    application_attempt=0,
+                    issue_code="translator_exception",
+                )
                 translation_result = TranslationResult(
                     text="",
                     status="failed",
@@ -660,8 +968,32 @@ else:
                     None,
                 )
             except Exception:
+                record_terminal_failure(
+                    DEFAULT_TRANSLATION_AUDIT_SINK,
+                    operation_id=translation_operation_id,
+                    stage="storage",
+                    application_attempt=0,
+                    issue_code="storage_exception",
+                )
                 st.error("回复已经生成，但聊天记录暂时没有保存成功；请稍后重试。")
                 st.stop()
+            record_stored_outcome(
+                DEFAULT_TRANSLATION_AUDIT_SINK,
+                operation_id=translation_operation_id,
+                translation_status=translation_result.status,
+                issue_code=issue_code,
+                message_id=ai_message_id,
+            )
+
+            if realtime_grounding.ui_artifacts:
+                try:
+                    save_ui_artifacts(
+                        DB_FILE,
+                        ai_message_id,
+                        realtime_grounding.ui_artifacts,
+                    )
+                except Exception:
+                    st.warning("回复已保存，但本轮天气或来源卡片暂时无法保存。")
 
             audio_attached = False
             tts_status = "disabled" if not tts_enabled else "not_requested"
