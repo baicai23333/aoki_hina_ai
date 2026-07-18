@@ -32,6 +32,16 @@ from admin_service import (
     record_admin_action,
     replace_user_password_hash,
 )
+from collector_worker import CollectorError, seed_information_sources_from_registry
+from information_store import (
+    InformationStoreError,
+    list_collector_runs,
+    list_information_sources,
+    list_official_updates,
+    revoke_official_update,
+    review_official_update,
+    set_source_enabled,
+)
 from tts_engine import load_env_var
 
 
@@ -47,6 +57,11 @@ _NOTICE_KEY = "aoki_admin_notice"
 _MAX_ADMIN_USERNAME_LENGTH = 256
 _MAX_ADMIN_HASH_LENGTH = 1024
 _PASSWORD_HASHER = PasswordHasher()
+
+
+@st.cache_resource(show_spinner=False)
+def _seed_information_sources_once(db_path: str, registry_path: str):
+    return seed_information_sources_from_registry(db_path, registry_path)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -520,15 +535,249 @@ def _audit_tab() -> None:
     )
 
 
+def _information_tab(actor: str) -> None:
+    """Review collected official updates without exposing raw page content."""
+
+    try:
+        _seed_information_sources_once(
+            str(DB_FILE),
+            str(ROOT / "official_sources.json"),
+        )
+    except (CollectorError, OSError, ValueError):
+        st.warning("官方来源登记暂时无法刷新；下面仍显示数据库中已有的信息。")
+    sources = list_information_sources(DB_FILE)
+    pending = list_official_updates(
+        DB_FILE,
+        verification_status="pending",
+        limit=100,
+    )
+    approved_updates = list_official_updates(
+        DB_FILE,
+        verification_status="approved",
+        limit=100,
+    )
+    update_history = list_official_updates(DB_FILE, limit=500)
+    update_by_id = {item.id: item for item in update_history}
+    superseded_by: dict[int, int] = {}
+    for latest in approved_updates:
+        ancestor_id = latest.replaces_update_id
+        seen_ids: set[int] = set()
+        while ancestor_id is not None and ancestor_id not in seen_ids:
+            seen_ids.add(ancestor_id)
+            superseded_by.setdefault(ancestor_id, latest.id)
+            ancestor = update_by_id.get(ancestor_id)
+            ancestor_id = ancestor.replaces_update_id if ancestor is not None else None
+    runs = list_collector_runs(DB_FILE, limit=100)
+
+    metrics = st.columns(4)
+    metrics[0].metric("登记来源", len(sources))
+    metrics[1].metric("已启用来源", sum(item.enabled for item in sources))
+    metrics[2].metric("待审核信息", len(pending))
+    metrics[3].metric("已批准信息", len(approved_updates))
+
+    st.subheader("官方来源")
+    st.caption("来源来自本地白名单；停用后，后续采集循环将跳过该来源。")
+    if sources:
+        st.dataframe(
+            [
+                {
+                    "来源": item.name,
+                    "类型": "网页" if item.source_type == "html" else "订阅",
+                    "可信等级": item.trust_level,
+                    "检查间隔（分钟）": item.fetch_interval_minutes,
+                    "状态": "已启用" if item.enabled else "已停用",
+                    "上次检查": item.last_checked_at or "尚未检查",
+                }
+                for item in sources
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        source_by_label = {
+            f"{item.name}（{'已启用' if item.enabled else '已停用'}）": item
+            for item in sources
+        }
+        selected_label = st.selectbox(
+            "选择需要切换的来源",
+            list(source_by_label),
+            key="admin_information_source",
+        )
+        selected_source = source_by_label[selected_label]
+        action_label = "停用来源" if selected_source.enabled else "启用来源"
+        if st.button(action_label, key="admin_information_source_toggle"):
+            set_source_enabled(
+                DB_FILE,
+                selected_source.id,
+                not selected_source.enabled,
+                actor=actor,
+            )
+            _set_notice("success", f"来源“{selected_source.name}”状态已更新。")
+            st.rerun()
+    else:
+        st.info("当前没有可用的官方来源。")
+
+    st.subheader("待审核信息")
+    st.caption("采集到的新内容不会直接进入聊天；只有管理员批准后才可作为确定事实使用。")
+    if not pending:
+        st.info("当前没有待审核信息。")
+    else:
+        update_by_label = {
+            f"#{item.id} · {item.title[:80]}": item for item in pending
+        }
+        selected_update_label = st.selectbox(
+            "选择待审核信息",
+            list(update_by_label),
+            key="admin_information_update",
+        )
+        update = update_by_label[selected_update_label]
+        with st.container(border=True):
+            st.text(update.title)
+            st.caption(
+                f"来源：{update.source_name} · 类型：{update.category} · "
+                f"置信度：{update.confidence:.2f}"
+            )
+            if update.summary:
+                st.text(update.summary)
+            details = []
+            if update.event_start_at:
+                details.append(f"开始：{update.event_start_at}")
+            if update.event_end_at:
+                details.append(f"结束：{update.event_end_at}")
+            if update.venue:
+                details.append(f"地点：{update.venue}")
+            if update.replaces_update_id is not None:
+                details.append(f"替代旧信息：#{update.replaces_update_id}")
+            if details:
+                st.text("\n".join(details))
+            st.link_button("查看官方原文", update.canonical_url)
+
+        with st.form("admin_information_review_form", clear_on_submit=True):
+            reason = st.text_input(
+                "审核备注（可选）",
+                max_chars=1_000,
+                help="备注只写入管理审计，不会展示给聊天用户。",
+            )
+            approve, reject = st.columns(2)
+            approved = approve.form_submit_button("批准进入正式信息库", type="primary")
+            rejected = reject.form_submit_button("拒绝这条信息")
+        if approved or rejected:
+            decision = "approved" if approved else "rejected"
+            review_official_update(
+                DB_FILE,
+                update.id,
+                decision,
+                actor=actor,
+                reason=reason or None,
+            )
+            message = "已批准，可供聊天查询。" if approved else "已拒绝，不会供聊天使用。"
+            _set_notice("success", message)
+            st.rerun()
+
+    st.subheader("已批准信息")
+    st.caption("发现误批或信息失效时可撤销；撤销后会立即停止作为聊天事实使用，并写入操作审计。")
+    if not approved_updates:
+        st.info("当前没有已批准信息。")
+    else:
+        approved_by_label = {
+            (
+                f"#{item.id} · {item.title[:70]}"
+                + (
+                    f"（已被 #{superseded_by[item.id]} 替代）"
+                    if item.id in superseded_by
+                    else ""
+                )
+            ): item
+            for item in approved_updates
+        }
+        approved_label = st.selectbox(
+            "选择已批准信息",
+            list(approved_by_label),
+            key="admin_information_approved_update",
+        )
+        approved_update = approved_by_label[approved_label]
+        with st.container(border=True):
+            st.text(approved_update.title)
+            st.caption(
+                f"来源：{approved_update.source_name} · 类型：{approved_update.category} · "
+                f"状态：{approved_update.status}"
+            )
+            if approved_update.summary:
+                st.text(approved_update.summary)
+            if approved_update.replaces_update_id is not None:
+                st.caption(f"这条信息替代：#{approved_update.replaces_update_id}")
+            if approved_update.id in superseded_by:
+                st.warning(
+                    f"这条旧信息已被 #{superseded_by[approved_update.id]} 替代，"
+                    "不会再用于聊天回答。"
+                )
+            st.link_button("查看官方原文", approved_update.canonical_url)
+
+        with st.form("admin_information_revoke_form", clear_on_submit=True):
+            revoke_reason = st.text_input(
+                "撤销原因",
+                max_chars=1_000,
+                help="必填；原因只写入管理审计，不会展示给聊天用户。",
+            )
+            revoked = st.form_submit_button("撤销这条已批准信息")
+        if revoked:
+            if not revoke_reason.strip():
+                st.error("请填写撤销原因。")
+            else:
+                revoke_official_update(
+                    DB_FILE,
+                    approved_update.id,
+                    actor=actor,
+                    reason=revoke_reason,
+                )
+                _set_notice("success", "信息已撤销，不再供聊天使用。")
+                st.rerun()
+
+    st.subheader("最近采集运行")
+    if not runs:
+        st.info("采集任务还没有运行记录。")
+    else:
+        st.dataframe(
+            [
+                {
+                    "开始时间": item.started_at,
+                    "来源": item.source_name or f"来源 #{item.source_id}",
+                    "状态": item.status,
+                    "发现": item.discovered_count,
+                    "抓取": item.fetched_count,
+                    "新原文": item.new_document_count,
+                    "待审核": item.pending_update_count,
+                    "异常": "是" if item.error_code else "否",
+                }
+                for item in runs
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
 def _system_tab() -> None:
     api_key_configured = bool(load_env_var("DEEPSEEK_API_KEY"))
+    official_search_configured = bool(load_env_var("TAVILY_API_KEY"))
+    general_search_configured = bool(
+        load_env_var("TAVILY_API_KEY") or load_env_var("BRAVE_SEARCH_API_KEY")
+    )
+    weather_enabled = _env_flag("AOKI_WEATHER_ENABLED", default=True)
+    tools_enabled = _env_flag("AOKI_TOOL_CALLING_ENABLED", default=True)
     tts_enabled = _env_flag("AOKI_TTS_ENABLED")
     content_enabled = _env_flag("AOKI_ADMIN_ALLOW_MESSAGE_CONTENT")
 
-    status_columns = st.columns(3)
+    status_columns = st.columns(6)
     status_columns[0].metric("聊天模型", "已配置" if api_key_configured else "未配置")
-    status_columns[1].metric("语音", "已开启" if tts_enabled else "已关闭")
-    status_columns[2].metric("正文审阅", "已开启" if content_enabled else "已关闭")
+    status_columns[1].metric("即时工具", "已开启" if tools_enabled else "已关闭")
+    status_columns[2].metric("天气", "已开启" if weather_enabled else "已关闭")
+    status_columns[3].metric(
+        "官方搜索", "已配置" if official_search_configured else "未配置"
+    )
+    status_columns[4].metric(
+        "普通搜索", "已配置" if general_search_configured else "未配置"
+    )
+    status_columns[5].metric("语音", "已开启" if tts_enabled else "已关闭")
+    st.caption(f"聊天正文审阅：{'已开启' if content_enabled else '已关闭'}。后台不会显示任何密钥值。")
 
     st.subheader("数据库状态")
     st.caption("完整检查可能需要一点时间，只会在你点击后运行。")
@@ -577,7 +826,7 @@ def main() -> None:
     try:
         section = st.radio(
             "后台栏目",
-            ["总览", "用户", "聊天审阅", "操作审计", "系统"],
+            ["总览", "用户", "聊天审阅", "即时信息", "操作审计", "系统"],
             horizontal=True,
             label_visibility="collapsed",
         )
@@ -587,11 +836,13 @@ def main() -> None:
             _users_tab(actor)
         elif section == "聊天审阅":
             _content_tab(actor)
+        elif section == "即时信息":
+            _information_tab(actor)
         elif section == "操作审计":
             _audit_tab()
         else:
             _system_tab()
-    except (AdminServiceError, sqlite3.Error, OSError):
+    except (AdminServiceError, InformationStoreError, sqlite3.Error, OSError):
         st.error("后台暂时无法读取站点数据。聊天页面和现有数据未被修改。")
 
 

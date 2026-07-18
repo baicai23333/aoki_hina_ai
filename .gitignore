@@ -1,5 +1,6 @@
 .env
 *.log
+/logs/translation_audit.log*
 chat_history.db
 chat_history.json
 

@@ -21,6 +21,15 @@ TRANSLATION_STATUSES = (
     "legacy_unverified",
 )
 PLAYABLE_TRANSLATION_STATUSES = ("validated", "fixed")
+MANUALLY_RETRYABLE_TRANSLATION_ISSUES = frozenset(
+    {
+        "translator_exception",
+        "reviewer_exception",
+        "reviewer_invalid_json",
+        "reviewer_invalid_schema",
+    }
+)
+_MANUAL_RETRY_RESULT_STATUSES = frozenset({"validated", "rejected", "failed"})
 
 _TABLE_NAME = "chat_history"
 _SELECT_COLUMNS = (
@@ -379,6 +388,91 @@ def update_message_audio(
             "WHERE id = ? AND username = ? AND type = 'ai' "
             "AND translation_status IN ('validated', 'fixed')",
             (clean_audio, clean_message_id, cleaned_username),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_failed_message_translation(
+    db_path: DatabasePath,
+    username: str,
+    message_id: int,
+    expected_content: str,
+    expected_issue_code: str,
+    japanese_text: str | None,
+    translation_status: str,
+    translation_issue_code: str | None,
+) -> bool:
+    """Atomically replace one retryable failed translation.
+
+    The compare-and-swap conditions prevent a stale Streamlit page from
+    overwriting another session's result. Audio is always cleared because it
+    belongs to the previous translation state.
+    """
+
+    cleaned_username = _required_username(username)
+    clean_message_id = _required_message_id(message_id)
+    clean_expected_content = _required_message_text(
+        expected_content,
+        "expected_content",
+    )
+    clean_expected_issue = _optional_text(
+        expected_issue_code,
+        "expected_issue_code",
+    )
+    if clean_expected_issue not in MANUALLY_RETRYABLE_TRANSLATION_ISSUES:
+        raise ChatStorageValidationError(
+            "expected_issue_code is not eligible for manual retry"
+        )
+
+    clean_status = _required_translation_status(translation_status)
+    if clean_status not in _MANUAL_RETRY_RESULT_STATUSES:
+        raise ChatStorageValidationError(
+            "manual retry result must be validated, rejected, or failed"
+        )
+    clean_japanese = _optional_text(japanese_text, "japanese_text")
+    clean_issue = _optional_text(translation_issue_code, "translation_issue_code")
+
+    if clean_status == "validated":
+        if clean_japanese is None:
+            raise ChatStorageValidationError(
+                "validated translations require japanese_text"
+            )
+        if clean_issue is not None:
+            raise ChatStorageValidationError(
+                "validated translations cannot contain an issue code"
+            )
+        stored_japanese = clean_japanese
+    else:
+        if clean_issue is None:
+            raise ChatStorageValidationError(
+                "failed or rejected translations require an issue code"
+            )
+        stored_japanese = None
+
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            f"UPDATE {_TABLE_NAME} SET japanese_content = ?, audio_path = NULL, "
+            "translation_status = ?, translation_issue_code = ? "
+            "WHERE id = ? AND username = ? AND type = 'ai' "
+            "AND content = ? AND translation_status = 'failed' "
+            "AND translation_issue_code = ?",
+            (
+                stored_japanese,
+                clean_status,
+                clean_issue,
+                clean_message_id,
+                cleaned_username,
+                clean_expected_content,
+                clean_expected_issue,
+            ),
         )
         conn.commit()
         return cursor.rowcount == 1

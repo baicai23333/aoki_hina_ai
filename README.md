@@ -8,6 +8,10 @@ Streamlit chat app for a non-official fan-created AI character inspired by Aoki 
 - SQLite-backed user and chat history storage
 - User-controlled structured memory with per-account isolation and hard delete
 - DeepSeek chat model through LangChain
+- Browser-local time context plus user-controlled city or opt-in coarse location
+- On-demand Open-Meteo weather cards with short-lived caching
+- External Tavily/Brave search with a strict official-source allowlist and source cards
+- Independent official-information collector with hash deduplication and admin review
 - A five-stage persona pipeline with deterministic safety routing
 - A verified source registry with explicit quarantine states
 - Granular public fact claims kept separate from style guidance and user history
@@ -70,6 +74,95 @@ one browser session and is only a usability safeguard; Streamlit's reported
 client IP is not used as a security boundary. Use a unique admin password of at
 least 12 characters.
 
+## Time, weather, search, and official updates
+
+The web chat treats these as separate capabilities:
+
+```text
+browser timezone + trusted server UTC -> one-turn local time context
+explicit city or opt-in coarse location -> weather tool -> Open-Meteo card
+real-time/search intent -> bounded DeepSeek tool call -> external search
+independent collector -> raw official page -> DeepSeek JSON extraction
+                      -> hash deduplication -> pending admin review
+approved update database -> chat query; official search only when needed
+```
+
+The browser timezone and locale are stored per signed-in account, but a timezone
+is never converted into a guessed city. Users can manually save a home city or a
+temporary city. Browser geolocation runs only after the user presses the consent
+button, is rounded to coarse coordinates, expires after at most seven days, and
+is used only behind the weather tool gate. The UI never displays or stores a
+continuous location trail. Current time is calculated from server UTC on every
+request and is not copied into chat history.
+
+Weather uses [Open-Meteo](https://open-meteo.com/) from the backend. City
+geocoding is cached for 30 days and weather for 15 minutes. Tool results are
+rebuilt before entering the prompt or message artifacts, so latitude,
+longitude, browser accuracy, raw provider payloads, and internal errors are not
+shown or persisted with an assistant message.
+
+For search, add a Tavily key to `.env`:
+
+```text
+TAVILY_API_KEY=your_tavily_key
+BRAVE_SEARCH_API_KEY=optional_general_search_fallback
+```
+
+Tavily is required for `search_hina_official`, which is constrained to
+`official_sources.json`. Brave is used only as a fallback for ordinary web
+search. All search-provider snippets remain untrusted discovery leads,
+including those returned from an official domain. They are never promoted
+directly into a confirmed fact. An official URL must be fetched by the
+collector, extracted, reviewed in `/admin`, and approved before its data can
+ground a factual chat reply. URL matching still enforces HTTPS, the registered
+base path or exact social account, and the local blocklist; `aokihina.com` is
+explicitly blocked because it identifies itself as a fan site. If no search key
+is configured or a provider fails, the chat displays a fixed availability
+notice and does not fill the gap from model memory. Restart Streamlit after
+changing these settings.
+
+The collector is a separate process so updates continue even when nobody has
+the chat page open. A one-time run checks every enabled source:
+
+```powershell
+.\.venv\Scripts\python.exe collector_worker.py --once
+```
+
+An optional daily discovery pass can be added explicitly. It requires
+`TAVILY_API_KEY`, searches only the official-domain registry, and is capped at
+eight results. The normal `--once` command does not call a search provider or
+incur search cost.
+
+```powershell
+.\.venv\Scripts\python.exe collector_worker.py --once --search-discovery
+```
+
+Use `--search-query "..."` only when a different bounded official query is
+needed. Search result snippets, titles, and dates are discarded; only mapped
+URLs are passed to the collector, which fetches the official original before
+hashing, model extraction, and `pending` review.
+
+Continuous mode honors each source's `last_checked_at` and configured interval:
+
+```powershell
+.\.venv\Scripts\python.exe collector_worker.py --loop --interval-seconds 300
+```
+
+Run the continuous command under Windows Task Scheduler or another service
+manager for unattended operation. In Task Scheduler, set **Start in** to
+`D:\aoki_hina_ai`; alternatively, use absolute paths for both the virtual-
+environment Python executable and `collector_worker.py`. Search engines are only for discovering URLs;
+the collector re-fetches an allowlisted official page, stores its canonical URL,
+visible source text, timestamps, and SHA-256 hash, then asks DeepSeek for strict
+JSON. Each request and redirect hop must remain HTTPS on port 443, match the
+source allowlist, and resolve only to public addresses. A source checks at most
+20 links by default, while batch-wide document and model-call budgets prevent
+unbounded work. New or changed items always enter `pending`. In `/admin` → `即时信息`, an
+administrator can enable or disable sources, review summaries against the
+official original, approve, reject, or later revoke items, and inspect safe run
+counters. Only approved, non-superseded rows are returned by the chat's
+recent-update tool. Raw page text is not displayed in the admin UI.
+
 ## Persona pipeline
 
 The main response path is:
@@ -77,9 +170,11 @@ The main response path is:
 ```text
 user input
   -> deterministic scene classification
+  -> real-time intent only: reviewed database first, then at most one selected external tool call
   -> select up to six relevant, user-saved memories for ordinary chat only
-  -> verified source and evidence retrieval
-  -> public fact question: deterministic rendering from verified claims
+  -> verified static source, dynamic grounding, and style evidence retrieval
+  -> static public fact: deterministic rendering from verified claims
+  -> dynamic public fact: grounded generation plus strict review
   -> other scenes: DeepSeek planning and styled generation
   -> strict DeepSeek review + deterministic identity/privacy checks
   -> temperature-zero translation + deterministic checks + strict review

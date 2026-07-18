@@ -1,0 +1,161 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "name": "hina_hibiki_profile",
+      "source_type": "web",
+      "base_url": "https://hibiki-cast.jp/hibiki_f/aoki_hina/",
+      "domain": "hibiki-cast.jp",
+      "trust_level": 100,
+      "collector_enabled": false,
+      "categories": ["profile", "agency", "voice_work", "appearance"]
+    },
+    {
+      "name": "hina_hibiki_news",
+      "source_type": "web",
+      "base_url": "https://hibiki-cast.jp/news/",
+      "domain": "hibiki-cast.jp",
+      "trust_level": 100,
+      "collector_enabled": true,
+      "fetch_interval_minutes": 120,
+      "categories": ["agency_notice", "appearance", "schedule_change", "safety_notice"]
+    },
+    {
+      "name": "hina_bm_echoes",
+      "source_type": "web",
+      "base_url": "https://bm-echoes.com/",
+      "domain": "bm-echoes.com",
+      "trust_level": 100,
+      "collector_enabled": true,
+      "fetch_interval_minutes": 120,
+      "categories": ["solo_release", "solo_live", "event", "ticket", "music_work", "correction"]
+    },
+    {
+      "name": "bushiroad_music",
+      "source_type": "web",
+      "base_url": "https://bushiroad-music.com/",
+      "domain": "bushiroad-music.com",
+      "trust_level": 100,
+      "collector_enabled": false,
+      "categories": ["release", "discography", "live", "event", "ticket", "campaign", "correction"]
+    },
+    {
+      "name": "bang_dream_mygo",
+      "source_type": "web",
+      "base_url": "https://bang-dream.com/artist/mygo/",
+      "domain": "bang-dream.com",
+      "trust_level": 100,
+      "collector_enabled": false,
+      "categories": ["mygo_profile", "mygo_news", "mygo_live", "mygo_event", "mygo_release", "mygo_discography"]
+    },
+    {
+      "name": "bang_dream_mygo_news",
+      "source_type": "web",
+      "base_url": "https://bang-dream.com/news/?artist=mygo",
+      "domain": "bang-dream.com",
+      "trust_level": 100,
+      "collector_enabled": true,
+      "fetch_interval_minutes": 30,
+      "categories": ["mygo_news", "mygo_live", "mygo_event", "mygo_release", "mygo_ticket", "correction"]
+    },
+    {
+      "name": "anime_mygo",
+      "source_type": "web",
+      "base_url": "https://anime.bang-dream.com/mygo/",
+      "domain": "anime.bang-dream.com",
+      "trust_level": 100,
+      "collector_enabled": true,
+      "fetch_interval_minutes": 360,
+      "categories": ["anime", "broadcast", "streaming", "cast", "film"]
+    },
+    {
+      "name": "anime_mygo_avemujica_sequel",
+      "source_type": "web",
+      "base_url": "https://anime.bang-dream.com/mygo-avemujica/",
+      "domain": "anime.bang-dream.com",
+      "trust_level": 100,
+      "collector_enabled": true,
+      "fetch_interval_minutes": 360,
+      "categories": ["anime", "broadcast", "streaming", "cast"]
+    },
+    {
+      "name": "mygo_movie",
+      "source_type": "web",
+      "base_url": "https://mygo-movie.bang-dream.com/",
+      "domain": "mygo-movie.bang-dream.com",
+      "trust_level": 100,
+      "collector_enabled": true,
+      "fetch_interval_minutes": 360,
+      "categories": ["film", "screening", "event", "ticket", "streaming", "home_video"]
+    },
+    {
+      "name": "bushiroad_press",
+      "source_type": "web",
+      "base_url": "https://bushiroad.com/media/",
+      "domain": "bushiroad.com",
+      "trust_level": 98,
+      "collector_enabled": false,
+      "categories": ["press_release", "company_announcement", "live", "release", "cross_link_verification"]
+    },
+    {
+      "name": "bushiroad_corporate",
+      "source_type": "web",
+      "base_url": "https://bushiroad.co.jp/",
+      "domain": "bushiroad.co.jp",
+      "trust_level": 98,
+      "collector_enabled": false,
+      "categories": ["company_announcement", "agency", "press_release"]
+    },
+    {
+      "name": "hina_personal_x",
+      "source_type": "social_exact",
+      "base_url": "https://x.com/aoki__hina",
+      "domain": "x.com",
+      "exact_path": "/aoki__hina",
+      "trust_level": 98,
+      "categories": ["personal_update", "appearance", "live", "release"]
+    },
+    {
+      "name": "hina_artist_staff_x",
+      "source_type": "social_exact",
+      "base_url": "https://x.com/AokiHina_Staff",
+      "domain": "x.com",
+      "exact_path": "/AokiHina_Staff",
+      "trust_level": 100,
+      "categories": ["solo_release", "solo_live", "event", "ticket", "correction"]
+    },
+    {
+      "name": "mygo_official_x",
+      "source_type": "social_exact",
+      "base_url": "https://x.com/bang_dream_mygo",
+      "domain": "x.com",
+      "exact_path": "/bang_dream_mygo",
+      "trust_level": 100,
+      "categories": ["mygo_news", "live", "event", "ticket", "release", "urgent_change"]
+    },
+    {
+      "name": "hina_artist_youtube",
+      "source_type": "social_exact",
+      "base_url": "https://www.youtube.com/@Aokihina-ArtistOfficial",
+      "domain": "youtube.com",
+      "exact_path": "/@Aokihina-ArtistOfficial",
+      "trust_level": 98,
+      "categories": ["solo_music_video", "live_video", "livestream", "release"]
+    },
+    {
+      "name": "mygo_official_youtube",
+      "source_type": "social_exact",
+      "base_url": "https://www.youtube.com/@bang_dream_mygo",
+      "domain": "youtube.com",
+      "exact_path": "/@bang_dream_mygo",
+      "trust_level": 100,
+      "categories": ["official_video", "livestream", "live_archive", "release"]
+    }
+  ],
+  "blocklist": [
+    {
+      "domain": "aokihina.com",
+      "reason": "The site identifies itself as a fan site and is not an official source."
+    }
+  ]
+}

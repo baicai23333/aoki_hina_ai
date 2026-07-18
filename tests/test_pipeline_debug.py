@@ -87,6 +87,34 @@ class PipelineDebugTests(unittest.TestCase):
         self.assertEqual(trace["translation_status"], "failed")
         self.assertEqual(trace["tts_status"], "failed")
 
+    def test_grounded_public_fact_uses_distinct_safe_route(self):
+        result = FakeResult(
+            Intent.PUBLIC_FACT,
+            [],
+            [],
+            [],
+            {"boundary_action": "none", "grounded": True},
+            [],
+        )
+
+        trace = build_debug_trace(result)
+
+        self.assertEqual(trace["route"], "grounded_public_fact")
+
+    def test_runtime_time_answer_uses_deterministic_route(self):
+        result = FakeResult(
+            Intent.DAILY_CHAT,
+            [],
+            [],
+            [],
+            {"boundary_action": "none", "runtime_time_answer": True},
+            [],
+        )
+
+        trace = build_debug_trace(result)
+
+        self.assertEqual(trace["route"], "deterministic_runtime")
+
 
 if __name__ == "__main__":
     unittest.main()

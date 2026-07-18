@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from langchain_core.messages import AIMessage
 
@@ -16,6 +17,7 @@ from safety_responses import (
     INSUFFICIENT_EVIDENCE_RESPONSE,
     PRIVATE_RESPONSE,
 )
+from translation_audit import DEFAULT_TRANSLATION_AUDIT_SINK, TranslationAuditEvent
 
 
 class FakeLLM:
@@ -42,7 +44,24 @@ class FakeLLM:
         return "\n".join(str(call[1].content) for call in self.calls)
 
 
+class RecordingAuditSink:
+    def __init__(self):
+        self.events: list[TranslationAuditEvent] = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+
 class ResponseTranslationServiceTests(unittest.TestCase):
+    def setUp(self):
+        audit_patcher = patch.object(
+            DEFAULT_TRANSLATION_AUDIT_SINK,
+            "emit",
+            return_value=None,
+        )
+        audit_patcher.start()
+        self.addCleanup(audit_patcher.stop)
+
     def test_fixed_safety_responses_never_call_models(self):
         cases = (
             (
@@ -336,6 +355,7 @@ class ResponseTranslationServiceTests(unittest.TestCase):
             [
                 "今日は3分だけ音楽について話しましょう。",
                 RuntimeError("secret retry error"),
+                RuntimeError("secret retry error again"),
             ]
         )
         reviewer = FakeLLM()
@@ -347,7 +367,123 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         self.assertEqual(result.text, "")
         self.assertEqual(result.issue_codes, ("translator_exception",))
         self.assertNotIn("secret", repr(result))
+        self.assertEqual(len(translator.calls), 3)
+        self.assertEqual(reviewer.calls, [])
+
+    def test_initial_translator_exception_gets_one_service_retry(self):
+        candidate = "今日は寒いですね。"
+        translator = FakeLLM(
+            [RuntimeError("secret transient failure"), candidate]
+        )
+        reviewer = FakeLLM([json.dumps({"ok": True, "issues": []})])
+        audit_sink = RecordingAuditSink()
+        service = ResponseTranslationService(
+            translator,
+            reviewer,
+            audit_sink=audit_sink,
+        )
+
+        result = service.translate(
+            "今天好冷。",
+            "daily_chat",
+            "none",
+            operation_id="retry-op-1",
+        )
+
+        self.assertEqual(result.status, "validated")
+        self.assertEqual(result.text, candidate)
         self.assertEqual(len(translator.calls), 2)
+        self.assertEqual(len(reviewer.calls), 1)
+        provider_events = [
+            event for event in audit_sink.events if event.event == "provider_exception"
+        ]
+        self.assertEqual(len(provider_events), 1)
+        self.assertEqual(provider_events[0].operation_id, "retry-op-1")
+        self.assertEqual(provider_events[0].application_attempt, 1)
+        self.assertTrue(provider_events[0].retry_scheduled)
+        self.assertEqual(provider_events[0].exception_type, "RuntimeError")
+
+    def test_initial_translator_exception_exhaustion_fails_after_two_calls(self):
+        translator = FakeLLM(
+            [
+                RuntimeError("secret first failure"),
+                RuntimeError("secret second failure"),
+            ]
+        )
+        audit_sink = RecordingAuditSink()
+        service = ResponseTranslationService(
+            translator,
+            FakeLLM(),
+            audit_sink=audit_sink,
+        )
+
+        result = service.translate(
+            "今天好冷。",
+            "daily_chat",
+            "none",
+            operation_id="retry-op-2",
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.issue_codes, ("translator_exception",))
+        self.assertEqual(len(translator.calls), 2)
+        provider_events = [
+            event for event in audit_sink.events if event.event == "provider_exception"
+        ]
+        self.assertEqual(
+            [event.application_attempt for event in provider_events],
+            [1, 2],
+        )
+        self.assertEqual(
+            [event.retry_scheduled for event in provider_events],
+            [True, False],
+        )
+        self.assertTrue(
+            all(event.operation_id == "retry-op-2" for event in provider_events)
+        )
+        self.assertNotIn("secret", repr(result))
+
+    def test_repair_translator_exception_can_use_shared_retry(self):
+        first_candidate = "3回目に弾いたとき、左手で押さえました。"
+        repaired_candidate = "三回目に弾いたとき、左手で押さえました。"
+        translator = FakeLLM(
+            [
+                first_candidate,
+                RuntimeError("secret repair timeout"),
+                repaired_candidate,
+            ]
+        )
+        reviewer = FakeLLM([json.dumps({"ok": True, "issues": []})])
+        service = ResponseTranslationService(translator, reviewer, audit_sink=None)
+
+        result = service.translate(
+            "弹到第三遍的时候，左手按住了。",
+            "music_advice",
+            "none",
+        )
+
+        self.assertEqual(result.status, "validated")
+        self.assertEqual(result.text, repaired_candidate)
+        self.assertEqual(len(translator.calls), 3)
+        self.assertEqual(len(reviewer.calls), 1)
+
+    def test_one_exception_retry_budget_is_shared_across_translation_stages(self):
+        bad_candidate = "今日は3分だけ音楽について話しましょう。"
+        translator = FakeLLM(
+            [
+                RuntimeError("secret initial timeout"),
+                bad_candidate,
+                RuntimeError("secret repair timeout"),
+            ]
+        )
+        reviewer = FakeLLM()
+        service = ResponseTranslationService(translator, reviewer, audit_sink=None)
+
+        result = service.translate("今天也聊聊音乐吧。", "daily_chat", "none")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.issue_codes, ("translator_exception",))
+        self.assertEqual(len(translator.calls), 3)
         self.assertEqual(reviewer.calls, [])
 
     def test_retry_can_restore_an_ordinary_lost_negation(self):
@@ -513,8 +649,9 @@ class ResponseTranslationServiceTests(unittest.TestCase):
 
     def test_translator_and_reviewer_exceptions_fail_closed(self):
         translator_error = RuntimeError("secret translator exception")
+        translator = FakeLLM(error=translator_error)
         service = ResponseTranslationService(
-            FakeLLM(error=translator_error), FakeLLM()
+            translator, FakeLLM()
         )
 
         translator_result = service.translate("今天好冷。", "daily_chat", "none")
@@ -523,11 +660,11 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         self.assertEqual(translator_result.text, "")
         self.assertEqual(translator_result.issue_codes, ("translator_exception",))
         self.assertNotIn("secret", repr(translator_result))
+        self.assertEqual(len(translator.calls), 2)
 
         reviewer_error = RuntimeError("secret reviewer exception")
-        service = ResponseTranslationService(
-            FakeLLM(["今日は寒いですね。"]), FakeLLM(error=reviewer_error)
-        )
+        reviewer = FakeLLM(error=reviewer_error)
+        service = ResponseTranslationService(FakeLLM(["今日は寒いですね。"]), reviewer)
 
         reviewer_result = service.translate("今天好冷。", "daily_chat", "none")
 
@@ -535,6 +672,7 @@ class ResponseTranslationServiceTests(unittest.TestCase):
         self.assertEqual(reviewer_result.text, "")
         self.assertEqual(reviewer_result.issue_codes, ("reviewer_exception",))
         self.assertNotIn("secret", repr(reviewer_result))
+        self.assertEqual(len(reviewer.calls), 1)
 
     def test_reviewer_rejection_never_exposes_candidate_or_model_issue(self):
         candidate = "今日は少し休みましょう。"

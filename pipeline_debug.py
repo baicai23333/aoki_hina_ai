@@ -30,6 +30,7 @@ _VALIDATION_CODES = {
     "unexpected_japanese_output",
     "hidden_or_redacted_content",
     "empty_or_too_short",
+    "realtime_unavailable",
 }
 _TRANSLATION_STATUSES = {
     "not_requested",
@@ -90,14 +91,22 @@ def build_debug_trace(
     intent = getattr(raw_intent, "value", raw_intent)
     if not isinstance(intent, str) or not _SAFE_ID.fullmatch(intent):
         intent = "unknown"
-    if intent == "public_fact":
+    plan = getattr(result, "plan", {})
+    is_grounded = isinstance(plan, dict) and plan.get("grounded") is True
+    is_runtime_time = (
+        isinstance(plan, dict) and plan.get("runtime_time_answer") is True
+    )
+    if is_runtime_time:
+        route = "deterministic_runtime"
+    elif intent == "public_fact" and is_grounded:
+        route = "grounded_public_fact"
+    elif intent == "public_fact":
         route = "deterministic_public_fact"
     elif intent in {"identity_attack", "private_probe"}:
         route = "deterministic_boundary"
     else:
         route = "generated"
 
-    plan = getattr(result, "plan", {})
     raw_boundary = plan.get("boundary_action") if isinstance(plan, dict) else None
     boundary_action = raw_boundary if raw_boundary in _BOUNDARY_ACTIONS else "none"
 
